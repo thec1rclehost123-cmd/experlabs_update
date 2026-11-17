@@ -1,0 +1,335 @@
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import React from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { useSessionStore } from '@c1rcle/auth';
+
+import { MANAGEMENT } from '../../features/tickets/fixtures/ticket-management.test-fixtures';
+
+import TicketsPage from './page';
+
+const mockBffGet = vi.fn<(...args: readonly unknown[]) => Promise<unknown>>();
+const mockApiGet = vi.fn<(...args: readonly unknown[]) => Promise<unknown>>();
+const mockRouterPush = vi.fn();
+
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push: mockRouterPush }) }));
+
+vi.mock('@/lib/bff/bff-client', () => ({
+  bffClient: { get: (...args: unknown[]) => mockBffGet(...args) },
+}));
+
+vi.mock('@/lib/api/client', () => ({
+  apiClient: { get: (...args: unknown[]) => mockApiGet(...args) },
+}));
+
+vi.mock('next/image', () => ({
+  default: ({
+    alt,
+    preload: _preload,
+    fill: _fill,
+    ...props
+  }: React.ComponentProps<'img'> & { preload?: boolean; fill?: boolean }) => (
+    // eslint-disable-next-line @next/next/no-img-element
+    <img alt={alt} {...props} />
+  ),
+}));
+
+const ENTITLEMENT = {
+  id: 'ENT-rsvp-1',
+  orderId: 'RSVP-user1',
+  eventId: 'evt_rsvp_1',
+  organizationId: 'org_1',
+  tierId: 'tier_rsvp_1',
+  tierName: 'General Admission',
+  userId: 'user_1',
+  holderName: 'RSVP Guest',
+  status: 'valid',
+  scanCountAllowed: 1,
+  scanCount: 0,
+  scannedAt: [],
+  version: 1,
+  createdAt: '2026-09-23T00:00:00.000Z',
+  updatedAt: '2026-09-23T00:00:00.000Z',
+};
+
+const REAL_EVENT = {
+  id: 'evt_rsvp_1',
+  organizationId: 'org_1',
+  venueId: 'ven_1',
+  slug: 'rsvp-night',
+  title: 'RSVP Night',
+  summary: '',
+  description: '',
+  imageUrl: null,
+  startAt: '2026-12-25T18:00:00.000Z',
+  endAt: null,
+  status: 'published',
+  isPublic: true,
+  tags: [],
+  startingPricePaise: 0,
+  isFree: true,
+  cancellationReason: null,
+  version: 1,
+  createdAt: '2026-09-01T00:00:00.000Z',
+  updatedAt: '2026-09-01T00:00:00.000Z',
+};
+
+const REAL_VENUE = {
+  id: 'ven_1',
+  organizationId: 'org_1',
+  name: 'Sky Bar',
+  slug: 'sky-bar',
+  status: 'active',
+  description: '',
+  capacity: null,
+  city: 'Mumbai',
+  version: 1,
+  createdAt: '2026-09-01T00:00:00.000Z',
+  updatedAt: '2026-09-01T00:00:00.000Z',
+};
+
+function managedRead(path: string, entitlements: unknown[]): Promise<unknown> | null {
+  const managed = entitlements.map((value) => {
+    const ticket = value as typeof ENTITLEMENT;
+    return {
+      ...MANAGEMENT,
+      id: ticket.id,
+      orderId: ticket.orderId,
+      eventId: ticket.eventId,
+      tierId: ticket.tierId,
+      tierName: ticket.tierName,
+      holderName: ticket.holderName,
+      eventTitle: REAL_EVENT.title,
+      startsAt: REAL_EVENT.startAt,
+      endsAt: REAL_EVENT.endAt,
+      status:
+        ticket.status === 'redeemed' ? 'used' : ticket.status === 'void' ? 'cancelled' : 'active',
+      canPresent: ticket.status === 'valid',
+      unitKind: 'free_rsvp',
+      canTransfer: false,
+      transferUnavailableReason: 'Free RSVPs cannot be transferred.',
+    };
+  });
+  if (path === '/api/wallet/booking-tickets')
+    return Promise.resolve({ items: managed, nextCursor: null, total: managed.length });
+  if (path.endsWith('/management')) {
+    const ticket = managed.find((item) => path === `/api/tickets/${item.id}/management`);
+    return ticket
+      ? Promise.resolve(ticket)
+      : Promise.reject(new Error('Unknown ticket management'));
+  }
+  return null;
+}
+
+function mockWalletFeed(entitlements: unknown[] = [ENTITLEMENT]) {
+  mockBffGet.mockImplementation((arg: unknown) => {
+    const { path } = arg as { path: string };
+    const management = managedRead(path, entitlements);
+    if (management) return management;
+    if (path === '/api/tickets/ENT-rsvp-1/qr') {
+      return Promise.resolve({
+        qrPayload: 'ENT-rsvp-1:1791800000:test-signature',
+        expiresAt: '2026-12-10T12:00:30.000Z',
+        refreshIntervalSec: 30,
+      });
+    }
+    if (path === '/api/tickets/ENT-rsvp-1/transfers') return Promise.resolve([]);
+    if (path === '/api/wallet/event-covers') return Promise.resolve([]);
+    const items = path === '/api/wallet/tickets' ? entitlements : [];
+    return Promise.resolve({
+      items,
+      pageInfo: { page: 1, pageSize: 50, total: items.length, hasNextPage: false },
+    });
+  });
+  mockApiGet.mockImplementation((arg: unknown) => {
+    const { path } = arg as { path: string };
+    if (path === '/api/v2/public/events/evt_rsvp_1') return Promise.resolve(REAL_EVENT);
+    if (path === '/api/v2/public/venues/by-id/ven_1') return Promise.resolve(REAL_VENUE);
+    return Promise.reject(new Error(`unexpected path ${path}`));
+  });
+}
+
+function authenticate() {
+  useSessionStore.setState({ accessToken: 'test-access-token', status: 'authenticated' });
+}
+
+describe('TicketsPage real wallet', () => {
+  beforeEach(() => {
+    useSessionStore.setState({ accessToken: null, session: null, status: 'anonymous' });
+    mockBffGet.mockReset();
+    mockApiGet.mockReset();
+  });
+
+  it('renders a login prompt without fixture passes for logged-out visitors', () => {
+    render(<TicketsPage />);
+
+    expect(screen.getByRole('heading', { level: 1, name: 'TICKETS' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { level: 2, name: /your tickets live here/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /ticket tier/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'LOGIN TO ACCESS' })).toHaveAttribute('href', '/login');
+    expect(mockBffGet).not.toHaveBeenCalled();
+  });
+
+  it('keeps unresolved session bootstrap separate from the logged-out prompt', () => {
+    useSessionStore.setState({ status: 'unknown' });
+    render(<TicketsPage />);
+
+    expect(screen.getByRole('status')).toHaveTextContent('Checking your session');
+    expect(screen.queryByRole('link', { name: 'LOGIN TO ACCESS' })).not.toBeInTheDocument();
+    expect(mockBffGet).not.toHaveBeenCalled();
+  });
+
+  it('renders real wallet passes for an authenticated session', async () => {
+    authenticate();
+    mockWalletFeed();
+    render(<TicketsPage />);
+
+    expect(await screen.findByText('RSVP Night')).toBeInTheDocument();
+    expect(screen.getByText('General Admission')).toBeInTheDocument();
+    // Fixture passes never leak into the real wallet.
+    expect(screen.queryByText('AFTER HOURS: TECHNO RITUAL')).not.toBeInTheDocument();
+    expect(screen.queryByText('NEON RITUAL VOL. 3')).not.toBeInTheDocument();
+  });
+
+  it('bounds wallet and event-enrichment reads so loading cannot wait indefinitely', async () => {
+    authenticate();
+    mockWalletFeed();
+    render(<TicketsPage />);
+
+    expect(await screen.findByText('RSVP Night')).toBeInTheDocument();
+
+    expect(mockBffGet.mock.calls.map(([arg]) => arg)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: '/api/wallet/tickets', timeoutMs: 15_000, retries: 0 }),
+        expect.objectContaining({ path: '/api/wallet/orders', timeoutMs: 15_000, retries: 0 }),
+        expect.objectContaining({
+          path: '/api/wallet/event-covers',
+          timeoutMs: 15_000,
+          retries: 0,
+        }),
+      ]),
+    );
+    expect(mockApiGet.mock.calls.map(([arg]) => arg)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: '/api/v2/public/events/evt_rsvp_1',
+          timeoutMs: 10_000,
+          retries: 0,
+        }),
+        expect.objectContaining({
+          path: '/api/v2/public/venues/by-id/ven_1',
+          timeoutMs: 10_000,
+          retries: 0,
+        }),
+      ]),
+    );
+  });
+
+  it('shows the empty state when the wallet has no passes', async () => {
+    authenticate();
+    mockWalletFeed([]);
+    render(<TicketsPage />);
+
+    expect(await screen.findByText('NO CURRENT PASSES YET')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'EXPLORE EVENTS' })).toBeInTheDocument();
+  });
+
+  it('distinguishes a wallet read failure from a legitimately empty wallet', async () => {
+    authenticate();
+    mockBffGet.mockRejectedValue(new Error('gateway down'));
+    render(<TicketsPage />);
+
+    expect(await screen.findByRole('heading', { name: 'Tickets unavailable' })).toBeInTheDocument();
+    expect(screen.queryByText('NO CURRENT PASSES YET')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+  });
+
+  it('retries a failed wallet read without losing the authenticated session', async () => {
+    authenticate();
+    mockBffGet
+      .mockRejectedValueOnce(new Error('gateway down'))
+      .mockImplementation((arg: unknown) => {
+        const { path } = arg as { path: string };
+        const management = managedRead(path, [ENTITLEMENT]);
+        if (management) return management;
+        if (path === '/api/wallet/event-covers') return Promise.resolve([]);
+        const items = path === '/api/wallet/tickets' ? [ENTITLEMENT] : [];
+        return Promise.resolve({
+          items,
+          pageInfo: { page: 1, pageSize: 50, total: items.length, hasNextPage: false },
+        });
+      });
+    mockApiGet.mockImplementation((arg: unknown) => {
+      const { path } = arg as { path: string };
+      if (path === '/api/v2/public/events/evt_rsvp_1') return Promise.resolve(REAL_EVENT);
+      if (path === '/api/v2/public/venues/by-id/ven_1') return Promise.resolve(REAL_VENUE);
+      return Promise.reject(new Error(`unexpected path ${path}`));
+    });
+    render(<TicketsPage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByText('RSVP Night')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Tickets unavailable' })).not.toBeInTheDocument();
+  });
+
+  it('switches to history tab and displays past tickets', async () => {
+    authenticate();
+    mockBffGet.mockImplementation((arg: unknown) => {
+      const { path } = arg as { path: string };
+      const management = managedRead(path, [
+        { ...ENTITLEMENT, id: 'ENT-past-1', status: 'redeemed', scanCount: 1 },
+      ]);
+      if (management) return management;
+      if (path === '/api/wallet/event-covers') return Promise.resolve([]);
+      const items =
+        path === '/api/wallet/tickets'
+          ? [{ ...ENTITLEMENT, id: 'ENT-past-1', status: 'redeemed', scanCount: 1 }]
+          : [];
+      return Promise.resolve({
+        items,
+        pageInfo: { page: 1, pageSize: 50, total: items.length, hasNextPage: false },
+      });
+    });
+    mockApiGet.mockImplementation((arg: unknown) => {
+      const { path } = arg as { path: string };
+      if (path === '/api/v2/public/events/evt_rsvp_1') {
+        return Promise.resolve({ ...REAL_EVENT, endAt: '2026-01-02T00:00:00.000Z' });
+      }
+      if (path === '/api/v2/public/venues/by-id/ven_1') return Promise.resolve(REAL_VENUE);
+      return Promise.reject(new Error(`unexpected path ${path}`));
+    });
+    render(<TicketsPage />);
+
+    // A fully-scanned ticket lives in history, not current passes.
+    expect(await screen.findByText('NO CURRENT PASSES YET')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'HISTORY' }));
+    expect(screen.getByText('RSVP Night')).toBeInTheDocument();
+  });
+
+  it('opens authoritative ticket details for a real ticket', async () => {
+    authenticate();
+    mockWalletFeed();
+    render(<TicketsPage />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'View ticket details' }));
+
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    // The booking card and selected ticket both preserve the authoritative tier.
+    expect(screen.getAllByText('General Admission')).toHaveLength(2);
+    fireEvent.click(await screen.findByRole('button', { name: 'Show entry code' }));
+    expect(
+      await screen.findByRole('img', { name: 'Entry code for RSVP Night' }),
+    ).toBeInTheDocument();
+    expect(mockBffGet).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '/api/tickets/ENT-rsvp-1/qr' }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+  });
+});

@@ -1,0 +1,662 @@
+/**
+ * ─── Gateway environment/config — SOLE owner of process.env ──────────────────
+ * Every other file — including `@c1rcle/core` — consumes the validated config
+ * exported from here. Env is read once at cold start and validated; missing
+ * required values fail loudly (fail closed).
+ */
+
+import { BlockList, isIP } from 'node:net';
+
+import { z } from 'zod';
+
+const LOCAL_ORIGINS = 'http://localhost:3000,http://localhost:3001,http://localhost:3002';
+const LOCAL_TRUSTED_PROXY_CIDRS = '127.0.0.1,::1';
+const DEVELOPMENT_BETTER_AUTH_URL = 'http://localhost:8080';
+const APPROVED_EMAIL_TEST_RECIPIENT = 'aayushdivase2020333@gmail.com';
+
+/** Parse a comma-separated environment setting without silently accepting blanks. */
+export function parseList(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
+function normalizeAddress(address: string): string {
+  const mappedIpv4 = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(address);
+  return mappedIpv4?.[1] ?? address;
+}
+
+function validateProxyEntry(entry: string): void {
+  const separator = entry.lastIndexOf('/');
+  const address = separator === -1 ? entry : entry.slice(0, separator);
+  const version = isIP(address);
+  if (version === 0) throw new Error(`Invalid trusted proxy address: ${entry}`);
+
+  if (separator === -1) return;
+  const prefix = Number(entry.slice(separator + 1));
+  const maximum = version === 4 ? 32 : 128;
+  if (!Number.isInteger(prefix) || prefix < 1 || prefix > maximum) {
+    throw new Error(`Invalid trusted proxy CIDR: ${entry}`);
+  }
+}
+
+/**
+ * Build the same restricted address matcher used by Fastify and request-ID
+ * handling. A zero-length prefix is rejected so configuration cannot become
+ * an unrestricted trust-all proxy policy.
+ */
+export function createTrustedProxyMatcher(entries: readonly string[]) {
+  const blockList = new BlockList();
+  for (const entry of entries) {
+    validateProxyEntry(entry);
+    const separator = entry.lastIndexOf('/');
+    const address = normalizeAddress(separator === -1 ? entry : entry.slice(0, separator));
+    const version = isIP(address);
+    const type = version === 6 ? 'ipv6' : 'ipv4';
+    if (separator === -1) blockList.addAddress(address, type);
+    else blockList.addSubnet(address, Number(entry.slice(separator + 1)), type);
+  }
+
+  return (address: string | undefined): boolean => {
+    if (!address) return false;
+    const normalized = normalizeAddress(address);
+    const version = isIP(normalized);
+    return version > 0 && blockList.check(normalized, version === 6 ? 'ipv6' : 'ipv4');
+  };
+}
+
+/**
+ * Validates a comma-separated origin list and returns each entry in canonical
+ * `URL.origin` form. `@fastify/cors` and Better Auth compare origins as exact
+ * strings, and a browser's `Origin` header is always canonical (lower-case
+ * host, no default port, no trailing slash). Without normalising, a value
+ * like `https://app.example.com/` passes validation yet silently never
+ * matches, so every cross-origin preflight from that frontend is refused.
+ */
+function validateOrigins(value: string, field: string): string[] {
+  const origins = parseList(value);
+  if (origins.length === 0) throw new Error(`${field} must contain at least one origin`);
+  const normalized: string[] = [];
+  for (const origin of origins) {
+    if (origin === '*' || origin.includes('*'))
+      throw new Error(`${field} cannot contain a wildcard origin`);
+    const parsed = new URL(origin);
+    if (
+      !['http:', 'https:'].includes(parsed.protocol) ||
+      parsed.pathname !== '/' ||
+      parsed.search !== '' ||
+      parsed.hash !== '' ||
+      parsed.username !== '' ||
+      parsed.password !== ''
+    ) {
+      throw new Error(`${field} must contain origin URLs without paths: ${origin}`);
+    }
+    if (!normalized.includes(parsed.origin)) normalized.push(parsed.origin);
+  }
+  return normalized;
+}
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  PORT: z.coerce.number().int().positive().default(8080),
+  HOST: z.string().min(1).default('0.0.0.0'),
+  LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error', 'silent']).default('info'),
+  /** Public edge URL used by callbacks and deployment-facing metadata. */
+  PUBLIC_API_URL: z.url().default(DEVELOPMENT_BETTER_AUTH_URL),
+  /** Comma-separated browser origins. Wildcards are rejected below. */
+  ALLOWED_ORIGINS: z.string().default(LOCAL_ORIGINS),
+  /** Optional explicit Better Auth origins; defaults to ALLOWED_ORIGINS. */
+  BETTER_AUTH_TRUSTED_ORIGINS: z.string().optional(),
+  /** Comma-separated Nginx/LB/ingress addresses or CIDRs. */
+  TRUSTED_PROXY_CIDRS: z.string().default(LOCAL_TRUSTED_PROXY_CIDRS),
+  /** Build metadata returned by the internal version endpoint. */
+  APP_VERSION: z.string().min(1).default('0.1.0'),
+  BUILD_SHA: z.string().min(1).default('unknown'),
+  REDIS_URL: z.string().min(1).default('redis://localhost:6379'),
+  /**
+   * Where rate-limit counters live. `memory` (default) is per instance and
+   * resets on restart; `redis` shares the window across instances using
+   * REDIS_URL, and falls back to memory if Redis is unreachable.
+   */
+  RATE_LIMIT_STORE: z.enum(['memory', 'redis']).default('memory'),
+  /**
+   * Release gate for payouts. While the funds flow (who may hold and distribute
+   * ticket money) and the tax rules are awaiting written legal, provider and CA
+   * approval, the endpoints that request, batch-run or release a payout are
+   * switched off by default in every environment.
+   * Set `true` only once those approvals are on file. Freezing a payout is a
+   * safety action and stays available either way; reads are unaffected.
+   */
+  PAYOUTS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Private access activation stays off outside explicit test/config handoff. */
+  M5_PRIVATE_ACCESS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Restricted eligibility sales stay off until policy/legal approval and door controls are ready. */
+  M5_ELIGIBILITY_RULES_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Ticket transfer writes remain off unless explicitly enabled. */
+  M5_TICKET_TRANSFERS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Preserve the existing offline-manifest behavior unless explicitly disabled for drain. */
+  M5_OFFLINE_TICKET_MANIFESTS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((value) => value === 'true'),
+  /** Operator attestation; must remain false until the documented drain window is proven. */
+  M5_OFFLINE_MANIFEST_DRAIN_COMPLETE: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Cover sales stay unavailable until policy, merchant and accounting gates are approved. */
+  M5_COVER_SALES_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Add-on sales stay off until their accounting, tax and commercial treatment is approved. */
+  M5_TICKET_ADDONS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Server-side approval of the participating merchant; never inferred from Venue acceptance. */
+  M5_COVER_MERCHANT_APPROVED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Explicitly activate newly issued balances only after business approval. */
+  M5_COVER_ACTIVATION_APPROVED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Reviewed cover account mapping is required before accepting any cover sale. */
+  M5_COVER_ACCOUNTING_APPROVED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  FIRESTORE_PROJECT_ID: z.string().min(1).default('c1rcle-staging'),
+  /** Explicit emulator endpoints; used to enable non-production test fixtures. */
+  FIRESTORE_EMULATOR_HOST: z.string().min(1).optional(),
+  FIREBASE_AUTH_EMULATOR_HOST: z.string().min(1).optional(),
+  /** B12: which repository adapter set `lib/v2-services.ts` wires up. */
+  STORAGE_DRIVER: z.enum(['memory', 'firestore']).default('memory'),
+  /** Process-wide workers require an explicit configuration decision. */
+  BACKGROUND_WORKERS_ENABLED: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  /** Firestore service-account credentials (only read/used when STORAGE_DRIVER=firestore). */
+  FIREBASE_CLIENT_EMAIL: z.string().optional(),
+  FIREBASE_PRIVATE_KEY: z.string().optional(),
+  /** Bucket for onboarding KYC images. Defaults to `<project>.firebasestorage.app`. */
+  FIREBASE_STORAGE_BUCKET: z.string().min(1).optional(),
+  /** B10: Better Auth. */
+  BETTER_AUTH_SECRET: z.string().min(1).default('dev-only-change-me'),
+  BETTER_AUTH_URL: z.url().default(DEVELOPMENT_BETTER_AUTH_URL),
+  /** Render's immutable commit metadata, consumed as BUILD_SHA when no override is supplied. */
+  RENDER_GIT_COMMIT: z.string().min(1).optional(),
+  /** Phase 4: Razorpay credentials. */
+  RAZORPAY_KEY_ID: z.string().min(1).optional(),
+  RAZORPAY_KEY_SECRET: z.string().min(1).optional(),
+  RAZORPAY_WEBHOOK_SECRET: z.string().min(1).optional(),
+  /**
+   * Phase 5: HMAC key for rotating door QR codes ("magic tickets") and for
+   * signing offline admission manifests. Forging this key forges entry to a
+   * paid event, so production refuses to boot without a real one rather than
+   * falling back to the well-known development default.
+   */
+  MAGIC_TICKET_SECRET: z.string().min(1).optional(),
+  /**
+   * At-rest encryption of bank-account numbers (AES-256-GCM, scrypt-derived).
+   * Without it the core falls back to a secret published in this repository,
+   * which protects nothing — production refuses to boot without a real one.
+   * Rotating it does not strand older records: those written under the legacy
+   * default stay readable (see `getFullAccountNumber`).
+   */
+  ENCRYPTION_KEY: z.string().min(1).optional(),
+  /** Optional scrypt salt for ENCRYPTION_KEY; changing it re-keys new writes. */
+  ENCRYPTION_SALT: z.string().min(1).optional(),
+  /** Email OTP delivery and at-rest OTP HMAC key. */
+  DEPLOYMENT_ENVIRONMENT: z.enum(['production', 'staging', 'local']).optional(),
+  RENDER_SERVICE_ID: z.string().optional(),
+  RENDER_GIT_BRANCH: z.string().optional(),
+  RENDER_EXTERNAL_URL: z.string().optional(),
+  PROMOTER_AGREEMENT_ARTIFACT: z
+    .string()
+    .transform((value, ctx) => {
+      try {
+        return z
+          .object({
+            version: z.string().trim().min(1).max(120),
+            status: z.enum(['approved', 'staging_only']),
+            text: z.string().min(1).max(10_000),
+            textSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+          })
+          .strict()
+          .parse(JSON.parse(value));
+      } catch {
+        ctx.addIssue({ code: 'custom', message: 'Invalid Promoter agreement artifact JSON' });
+        return z.NEVER;
+      }
+    })
+    .optional(),
+  RESEND_API_KEY: z.string().min(1).optional(),
+  /** Verified Resend sender identity, e.g. `THE C1RCLE <hello@example.com>`. */
+  RESEND_FROM_EMAIL: z.string().trim().min(1).optional(),
+  /** Exact allowlisted recipient for intentional non-production provider acceptance. */
+  RESEND_NON_PROD_TEST_RECIPIENT: z.email().trim().toLowerCase().optional(),
+  /** Enforce that allowlist even when NODE_ENV is production-like (for staging). */
+  RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+  EMAIL_OTP_SECRET: z.string().min(1).optional(),
+  /**
+   * Public origin of the partner dashboard (e.g. https://partners.thec1rcle.com).
+   * Used to build absolute staff-invitation accept links in invitation emails.
+   * Optional: when absent, emails omit the link rather than linking nowhere.
+   */
+  PARTNER_DASHBOARD_URL: z.url().optional(),
+  /** Guest deployment origin for exact-email ticket assignment/transfer invitation links. */
+  GUEST_PORTAL_URL: z
+    .url({ protocol: /^https?$/ })
+    .refine((value) => {
+      const url = new URL(value);
+      return !url.username && !url.password && url.pathname === '/' && !url.search && !url.hash;
+    }, 'Use a Guest HTTP(S) origin without credentials or a path')
+    .optional(),
+  /**
+   * Comma-separated list of exact browser origins allowed to call the gateway
+   * cross-origin (CORS) and trusted by Better Auth, e.g.
+   * `https://c1rcle-v2-admin-console.vercel.app,https://partners.example.com`.
+   * Unset -> the local dev frontend origins outside production, and no
+   * cross-origin browser access at all in production. See `allowedBrowserOrigins`.
+   */
+  CORS_ALLOWED_ORIGINS: z.string().optional(),
+
+  /**
+   * Escape hatch for CI's Docker smoke-boot only — it exercises the
+   * production config guards (NODE_ENV=production) without real Firestore
+   * credentials, by design (see ci.yml's "Smoke-boot the container" step).
+   * `render.yaml` never sets this, so the real deploy still fails closed on
+   * STORAGE_DRIVER=memory in production.
+   */
+  ALLOW_MEMORY_STORAGE_IN_PRODUCTION: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+});
+
+/** The three frontends' `pnpm dev` ports: guest-portal, partner-dashboard, admin-console. */
+const DEV_FRONTEND_ORIGINS: readonly string[] = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+];
+
+interface ParsedOrigins {
+  readonly origins: string[];
+  readonly errors: string[];
+}
+
+/**
+ * Parses `CORS_ALLOWED_ORIGINS`. Every entry must be an exact origin
+ * (`scheme://host[:port]`, no path/query, no wildcard): the allow-list is the
+ * only thing standing between a credentialed browser request and the API, so
+ * anything looser than an exact match is rejected rather than interpreted.
+ */
+function parseOriginList(raw: string, requireHttps: boolean): ParsedOrigins {
+  const origins: string[] = [];
+  const errors: string[] = [];
+  for (const entry of raw.split(',')) {
+    const candidate = entry.trim().replace(/\/+$/, '');
+    if (candidate.length === 0) continue;
+    if (candidate.includes('*')) {
+      // `new URL('https://*.vercel.app')` parses and round-trips, so wildcards
+      // must be refused explicitly — this list is exact-match only.
+      errors.push(`"${candidate}" must not contain a wildcard`);
+      continue;
+    }
+    let url: URL;
+    try {
+      url = new URL(candidate);
+    } catch {
+      errors.push(`"${candidate}" is not a valid origin`);
+      continue;
+    }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      errors.push(`"${candidate}" must use http:// or https://`);
+    } else if (url.origin !== candidate) {
+      // Catches paths, queries, credentials and default-port noise.
+      errors.push(`"${candidate}" must be an exact origin like https://app.example.com`);
+    } else if (requireHttps && url.protocol !== 'https:') {
+      errors.push(`"${candidate}" must be https:// in production`);
+    } else if (!origins.includes(candidate)) {
+      origins.push(candidate);
+    }
+  }
+  return { origins, errors };
+}
+
+/**
+ * Browser origins allowed to make cross-origin (CORS) requests to the gateway,
+ * and trusted by Better Auth's origin check. Single source of truth for both.
+ */
+export function allowedBrowserOrigins(config: GatewayConfig): readonly string[] {
+  const raw = config.CORS_ALLOWED_ORIGINS;
+  if (raw !== undefined && raw.trim().length > 0) {
+    return parseOriginList(raw, config.NODE_ENV === 'production').origins;
+  }
+  return config.NODE_ENV === 'production' ? [] : DEV_FRONTEND_ORIGINS;
+}
+
+/** Fail closed: STORAGE_DRIVER=firestore requires real credentials, never a silent memory fallback. */
+const validatedEnvSchema = envSchema.superRefine((value, ctx) => {
+  if (value.PROMOTER_AGREEMENT_ARTIFACT?.status === 'staging_only') {
+    const independentlyIdentifiedStaging =
+      value.DEPLOYMENT_ENVIRONMENT === 'staging' &&
+      value.NODE_ENV === 'production' &&
+      value.STORAGE_DRIVER === 'firestore' &&
+      value.FIRESTORE_PROJECT_ID === 'c1rcle-v2' &&
+      !value.FIRESTORE_EMULATOR_HOST &&
+      value.RENDER_SERVICE_ID === 'srv-daar7op42hec73ecesdg' &&
+      value.RENDER_GIT_BRANCH === 'staging' &&
+      value.RENDER_EXTERNAL_URL === 'https://circle-v2-backend.onrender.com' &&
+      value.PUBLIC_API_URL === 'https://circle-v2-backend.onrender.com' &&
+      value.BETTER_AUTH_URL === 'https://circle-v2-backend.onrender.com';
+    if (!independentlyIdentifiedStaging)
+      ctx.addIssue({
+        code: 'custom',
+        path: ['PROMOTER_AGREEMENT_ARTIFACT'],
+        message:
+          'Staging agreement requires the explicitly identified staging Render service and origins',
+      });
+  }
+
+  if (value.RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST && !value.RESEND_NON_PROD_TEST_RECIPIENT) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RESEND_NON_PROD_TEST_RECIPIENT'],
+      message: 'The strict Resend test-recipient guard requires an exact allowlist recipient',
+    });
+  }
+  if (
+    value.RESEND_ENFORCE_TEST_RECIPIENT_ALLOWLIST &&
+    value.RESEND_NON_PROD_TEST_RECIPIENT !== APPROVED_EMAIL_TEST_RECIPIENT
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['RESEND_NON_PROD_TEST_RECIPIENT'],
+      message: 'The strict Resend test-recipient guard allows only the approved founder address',
+    });
+  }
+
+  const providerFields = [
+    'RAZORPAY_KEY_ID',
+    'RAZORPAY_KEY_SECRET',
+    'RAZORPAY_WEBHOOK_SECRET',
+  ] as const;
+  if (providerFields.some((field) => value[field] !== undefined)) {
+    for (const field of providerFields) {
+      if (!value[field]?.trim()) {
+        ctx.addIssue({
+          code: 'custom',
+          path: [field],
+          message: 'All three Razorpay provider fields must be configured together',
+        });
+      }
+    }
+    if (value.RAZORPAY_KEY_ID && !/^rzp_test_[A-Za-z0-9]+$/.test(value.RAZORPAY_KEY_ID)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['RAZORPAY_KEY_ID'],
+        message: 'M4 requires a Razorpay Test Mode key ID',
+      });
+    }
+  }
+  const allowedOrigins = (() => {
+    try {
+      return validateOrigins(value.ALLOWED_ORIGINS, 'ALLOWED_ORIGINS');
+    } catch (error) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['ALLOWED_ORIGINS'],
+        message: error instanceof Error ? error.message : 'Invalid allowed origins',
+      });
+      return [];
+    }
+  })();
+
+  const trustedOrigins = value.BETTER_AUTH_TRUSTED_ORIGINS ?? value.ALLOWED_ORIGINS;
+  try {
+    validateOrigins(trustedOrigins, 'BETTER_AUTH_TRUSTED_ORIGINS');
+  } catch (error) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['BETTER_AUTH_TRUSTED_ORIGINS'],
+      message: error instanceof Error ? error.message : 'Invalid Better Auth origins',
+    });
+  }
+
+  try {
+    const proxyEntries = parseList(value.TRUSTED_PROXY_CIDRS);
+    if (proxyEntries.length === 0) throw new Error('TRUSTED_PROXY_CIDRS must not be empty');
+    createTrustedProxyMatcher(proxyEntries);
+  } catch (error) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['TRUSTED_PROXY_CIDRS'],
+      message: error instanceof Error ? error.message : 'Invalid trusted proxy configuration',
+    });
+  }
+
+  if (value.STORAGE_DRIVER === 'firestore') {
+    const emulator = value.FIRESTORE_EMULATOR_HOST;
+    const loopback = emulator?.match(/^(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/);
+    const loopbackPort = Number(loopback?.[1]);
+    const localEmulator = Boolean(loopback && loopbackPort > 0 && loopbackPort <= 65535);
+    if (emulator !== undefined && !localEmulator) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIRESTORE_EMULATOR_HOST'],
+        message: 'M4 synthetic Firestore fixtures require an explicit loopback host and valid port',
+      });
+    }
+    if (!localEmulator && value.FIRESTORE_PROJECT_ID !== 'c1rcle-v2') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIRESTORE_PROJECT_ID'],
+        message: 'M4 real Firestore configuration must target c1rcle-v2',
+      });
+    }
+    if (!value.FIREBASE_CLIENT_EMAIL) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIREBASE_CLIENT_EMAIL'],
+        message: 'Required when STORAGE_DRIVER=firestore',
+      });
+    }
+    if (!value.FIREBASE_PRIVATE_KEY) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIREBASE_PRIVATE_KEY'],
+        message: 'Required when STORAGE_DRIVER=firestore',
+      });
+    }
+  }
+
+  if (value.CORS_ALLOWED_ORIGINS !== undefined) {
+    const { errors } = parseOriginList(value.CORS_ALLOWED_ORIGINS, value.NODE_ENV === 'production');
+    for (const message of errors) {
+      ctx.addIssue({ code: 'custom', path: ['CORS_ALLOWED_ORIGINS'], message });
+    }
+  }
+
+  if (value.FIREBASE_AUTH_EMULATOR_HOST !== undefined) {
+    const emulator = value.FIREBASE_AUTH_EMULATOR_HOST;
+    const loopback = /^(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})$/.exec(emulator);
+    const port = Number(loopback?.[1]);
+    if (!loopback || port < 1 || port > 65535) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIREBASE_AUTH_EMULATOR_HOST'],
+        message: 'Firebase Auth Emulator must use an explicit loopback host and valid port',
+      });
+    }
+    if (value.NODE_ENV === 'production') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['FIREBASE_AUTH_EMULATOR_HOST'],
+        message: 'Firebase Auth Emulator is not allowed in production',
+      });
+    }
+  }
+
+  if (value.NODE_ENV !== 'production') return;
+
+  if (value.STORAGE_DRIVER !== 'firestore' && !value.ALLOW_MEMORY_STORAGE_IN_PRODUCTION) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['STORAGE_DRIVER'],
+      message: 'Production requires STORAGE_DRIVER=firestore',
+    });
+  }
+  if (value.BETTER_AUTH_SECRET === 'dev-only-change-me' || value.BETTER_AUTH_SECRET.length < 32) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['BETTER_AUTH_SECRET'],
+      message: 'Production requires a non-development secret of at least 32 characters',
+    });
+  }
+  if (!value.EMAIL_OTP_SECRET || value.EMAIL_OTP_SECRET.length < 32) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['EMAIL_OTP_SECRET'],
+      message: 'Production requires EMAIL_OTP_SECRET of at least 32 characters',
+    });
+  }
+  if (value.RATE_LIMIT_STORE === 'redis') {
+    let redisUrl: URL | undefined;
+    try {
+      redisUrl = new URL(value.REDIS_URL);
+    } catch {
+      /* reported below */
+    }
+    if (
+      !redisUrl ||
+      !['redis:', 'rediss:'].includes(redisUrl.protocol) ||
+      ['localhost', '127.0.0.1', '::1'].includes(redisUrl.hostname)
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['REDIS_URL'],
+        message:
+          'RATE_LIMIT_STORE=redis in production needs a redis:// or rediss:// REDIS_URL that is not a local development endpoint',
+      });
+    }
+  }
+  if (!value.ENCRYPTION_KEY || value.ENCRYPTION_KEY.length < 32) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['ENCRYPTION_KEY'],
+      message: 'Production requires ENCRYPTION_KEY of at least 32 characters',
+    });
+  }
+  if (!value.MAGIC_TICKET_SECRET || value.MAGIC_TICKET_SECRET.length < 32) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['MAGIC_TICKET_SECRET'],
+      message: 'Production requires MAGIC_TICKET_SECRET of at least 32 characters',
+    });
+  }
+  for (const [field, rawOrigins] of [
+    ['ALLOWED_ORIGINS', allowedOrigins],
+    ['BETTER_AUTH_TRUSTED_ORIGINS', parseList(trustedOrigins)],
+  ] as const) {
+    for (const origin of rawOrigins) {
+      let parsed: URL;
+      try {
+        parsed = new URL(origin);
+      } catch {
+        continue;
+      }
+      if (parsed.protocol !== 'https:') {
+        ctx.addIssue({
+          code: 'custom',
+          path: [field],
+          message: `Production origins must use HTTPS: ${origin}`,
+        });
+      }
+      if (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1') {
+        ctx.addIssue({
+          code: 'custom',
+          path: [field],
+          message: `Production origins cannot be local development hosts: ${origin}`,
+        });
+      }
+    }
+  }
+  if (
+    new URL(value.PUBLIC_API_URL).protocol !== 'https:' ||
+    new URL(value.BETTER_AUTH_URL).protocol !== 'https:'
+  ) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['PUBLIC_API_URL', 'BETTER_AUTH_URL'],
+      message: 'Production public and Better Auth URLs must use HTTPS',
+    });
+  }
+});
+
+export type GatewayConfig = z.infer<typeof envSchema>;
+
+export function getAllowedOrigins(config: GatewayConfig): string[] {
+  return validateOrigins(config.ALLOWED_ORIGINS, 'ALLOWED_ORIGINS');
+}
+
+export function getBetterAuthTrustedOrigins(config: GatewayConfig): string[] {
+  return validateOrigins(
+    config.BETTER_AUTH_TRUSTED_ORIGINS ?? config.ALLOWED_ORIGINS,
+    'BETTER_AUTH_TRUSTED_ORIGINS',
+  );
+}
+
+export function getTrustedProxyCidrs(config: GatewayConfig): string[] {
+  return parseList(config.TRUSTED_PROXY_CIDRS);
+}
+
+export class GatewayConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GatewayConfigError';
+  }
+}
+
+let cached: GatewayConfig | null = null;
+
+/** Reads + validates env exactly once. Throws on invalid/missing required. */
+export function getGatewayConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig {
+  // Keep the production process fast while allowing tests and tooling to
+  // validate independent environment objects without mutating process.env.
+  if (env === process.env && cached) return cached;
+  // Render exposes the immutable deploy SHA as RENDER_GIT_COMMIT. Keep
+  // BUILD_SHA provider-neutral, but consume the documented Render value when
+  // an explicit BUILD_SHA override is not supplied.
+  const input =
+    env.BUILD_SHA || !env.RENDER_GIT_COMMIT ? env : { ...env, BUILD_SHA: env.RENDER_GIT_COMMIT };
+  const parsed = validatedEnvSchema.safeParse(input);
+  if (!parsed.success) {
+    const issues = parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
+    throw new GatewayConfigError(`Invalid environment configuration: ${issues}`);
+  }
+  if (env === process.env) cached = parsed.data;
+  return parsed.data;
+}

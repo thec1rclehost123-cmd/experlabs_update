@@ -1,0 +1,196 @@
+import { act, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { hydrateRoot } from 'react-dom/client';
+import { renderToString } from 'react-dom/server';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { PartnerShell } from './PartnerShell';
+
+const navigation = vi.hoisted(() => ({ pathname: '/partner/venue/overview' }));
+const authAccess = vi.hoisted(() => ({
+  tabVisibility: null as Record<string, boolean> | null,
+  displayName: 'Rhea Kapoor',
+}));
+const storedValues = new Map<string, string>();
+
+vi.mock('next/navigation', () => ({
+  usePathname: () => navigation.pathname,
+  useRouter: () => ({ replace: vi.fn() }),
+}));
+
+vi.mock('@/components/providers/DashboardAuthProvider', () => ({
+  useDashboardAuth: () => ({
+    profile: { displayName: authAccess.displayName },
+    signOut: vi.fn(),
+    tabVisibility: authAccess.tabVisibility,
+  }),
+}));
+
+describe('PartnerShell navigation layouts', () => {
+  beforeAll(() => {
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      value: {
+        clear: () => {
+          storedValues.clear();
+        },
+        getItem: (key: string) => storedValues.get(key) ?? null,
+        setItem: (key: string, value: string) => {
+          storedValues.set(key, value);
+        },
+      },
+    });
+  });
+
+  beforeEach(() => {
+    navigation.pathname = '/partner/venue/overview';
+    authAccess.tabVisibility = null;
+    authAccess.displayName = 'Rhea Kapoor';
+    window.localStorage.clear();
+  });
+
+  it('switches between side and top navigation and saves the preference', async () => {
+    const user = userEvent.setup();
+
+    render(
+      <PartnerShell studio="venue">
+        <div>Overview content</div>
+      </PartnerShell>,
+    );
+
+    const topbar = screen.getByRole('banner');
+    expect(within(topbar).getByText('Venue Studio')).toBeInTheDocument();
+    expect(within(topbar).queryByText('Overview')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('complementary', { name: 'Venue Studio navigation' }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText('Venue Studio workspace')).not.toBeInTheDocument();
+    expect(screen.queryByText(/read-only routes/i)).not.toBeInTheDocument();
+    const sidebar = screen.getByRole('complementary', { name: 'Venue Studio navigation' });
+    expect(within(sidebar).getByRole('button', { name: 'Use top navigation' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Help & Support' })).not.toBeInTheDocument();
+    await user.click(within(sidebar).getByRole('button', { name: 'Use top navigation' }));
+
+    expect(
+      screen.queryByRole('complementary', { name: 'Venue Studio navigation' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: 'Venue Studio navigation' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Use side navigation' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    expect(window.localStorage.getItem('c1rcle.partner.navigation-layout')).toBe('top');
+
+    await user.click(screen.getByRole('button', { name: 'Use side navigation' }));
+    expect(
+      screen.getByRole('complementary', { name: 'Venue Studio navigation' }),
+    ).toBeInTheDocument();
+    expect(window.localStorage.getItem('c1rcle.partner.navigation-layout')).toBe('side');
+  });
+
+  it.each(['venue', 'host', 'promoter'] as const)(
+    'keeps %s Settings in the account menu and out of primary navigation',
+    async (studio) => {
+      const user = userEvent.setup();
+      navigation.pathname = `/partner/${studio}/overview`;
+      render(
+        <PartnerShell studio={studio}>
+          <div>Content</div>
+        </PartnerShell>,
+      );
+      const settingsHref = `/partner/${studio}/settings`;
+      expect(screen.queryByRole('link', { name: 'Settings' })).not.toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: 'Account options for Rhea Kapoor' }));
+      const settingsLinks = screen.getAllByRole('link', { name: 'Settings' });
+      expect(settingsLinks).toHaveLength(1);
+      expect(settingsLinks.every((link) => link.getAttribute('href') === settingsHref)).toBe(true);
+      expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument();
+    },
+  );
+
+  it('keeps Settings in the account menu when top navigation is selected', async () => {
+    navigation.pathname = '/partner/host/overview';
+    window.localStorage.setItem('c1rcle.partner.navigation-layout', 'top');
+
+    render(
+      <PartnerShell studio="host">
+        <div>Host content</div>
+      </PartnerShell>,
+    );
+
+    const primaryNavigation = screen.getByRole('navigation', { name: 'Host Studio navigation' });
+    expect(
+      within(primaryNavigation).queryByRole('link', { name: 'Settings' }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Account options for Rhea Kapoor' }));
+    expect(screen.getByRole('link', { name: 'Settings' })).toHaveAttribute(
+      'href',
+      '/partner/host/settings',
+    );
+  });
+
+  it('restores a saved top-navigation preference', async () => {
+    navigation.pathname = '/partner/host/overview';
+    window.localStorage.setItem('c1rcle.partner.navigation-layout', 'top');
+
+    render(
+      <PartnerShell studio="host">
+        <div>Host content</div>
+      </PartnerShell>,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('navigation', { name: 'Host Studio navigation' }),
+      ).toBeInTheDocument();
+    });
+    expect(screen.getByRole('link', { name: 'Overview' })).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('hides navigation tabs the role matrix withholds', async () => {
+    authAccess.tabVisibility = { overview: false, finance: false, settings: false };
+
+    render(
+      <PartnerShell studio="venue">
+        <div>Overview content</div>
+      </PartnerShell>,
+    );
+
+    expect(screen.queryByRole('link', { name: 'Overview' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Finance' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Settings' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Account options for Rhea Kapoor' }));
+    expect(screen.queryByRole('link', { name: 'Settings' })).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Events' })).toBeInTheDocument();
+    // Segments with no backend opinion stay visible.
+    expect(screen.getByRole('link', { name: 'Marketing' })).toBeInTheDocument();
+  });
+
+  it('keeps the authenticated header name stable through server hydration', () => {
+    const tree = (
+      <PartnerShell studio="venue">
+        <div>Overview content</div>
+      </PartnerShell>
+    );
+    authAccess.displayName = 'Partner';
+    const container = document.createElement('div');
+    container.innerHTML = renderToString(tree);
+    document.body.append(container);
+    authAccess.displayName = 'Rhea Kapoor';
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    let root: ReturnType<typeof hydrateRoot> | null = null;
+    act(() => {
+      root = hydrateRoot(container, tree);
+    });
+
+    expect(consoleError.mock.calls.flat().join(' ')).not.toContain('Hydration failed');
+    expect(container).toHaveTextContent('Rhea Kapoor');
+
+    act(() => {
+      root?.unmount();
+    });
+    container.remove();
+    consoleError.mockRestore();
+  });
+});

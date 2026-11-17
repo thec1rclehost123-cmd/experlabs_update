@@ -1,0 +1,41 @@
+import { PartnerEventsScreen } from './PartnerEventsScreen';
+
+import type { HostEventsData, PartnerEventParty } from '@/data/partner-data-source';
+
+const hostEventsConfig = {
+  accent: 'lavender',
+  analyticsHref: '/partner/host/analytics',
+  createEventHref: '/partner/host/events/create',
+  defaultParty: 'hosts',
+  eventsBaseHref: '/partner/host/events',
+  eventSectionLabel: 'Host',
+  emptyDescription: 'Events created or assigned to this host organization will appear here.',
+  partyFilterLabel: 'Event ownership',
+  showViewToggle: false,
+  slotRequestsHref: '/partner/host/slot-requests',
+} as const;
+
+export function HostEventsScreen({
+  data,
+  initialSearch,
+  initialStatus,
+  initialParty,
+  initialView,
+}: {
+  readonly data: HostEventsData;
+  readonly initialSearch?: string;
+  readonly initialStatus?: 'all' | 'Live' | 'Draft' | 'Completed';
+  readonly initialParty?: PartnerEventParty;
+  readonly initialView?: 'list' | 'grid';
+}) {
+  return (
+    <PartnerEventsScreen
+      config={hostEventsConfig}
+      data={data}
+      initialSearch={initialSearch}
+      initialStatus={initialStatus}
+      initialParty={initialParty}
+      initialView={initialView}
+    />
+  );
+}

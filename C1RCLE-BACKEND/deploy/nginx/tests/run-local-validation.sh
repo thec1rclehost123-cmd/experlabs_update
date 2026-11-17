@@ -1,0 +1,430 @@
+#!/bin/sh
+
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+image_name="${C1RCLE_NGINX_IMAGE:-c1rcle-nginx:local}"
+container_name="c1rcle-nginx-validation-$$"
+api_pid=""
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/c1rcle-nginx-validation.XXXXXX")
+
+cleanup() {
+    set +e
+    docker rm -f "$container_name" >/dev/null 2>&1
+    if [ -n "$api_pid" ]; then
+        kill "$api_pid" >/dev/null 2>&1
+        wait "$api_pid" >/dev/null 2>&1
+    fi
+    rm -rf "$temp_dir"
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+require_command() {
+    command_name="$1"
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Required command not found: $command_name" >&2
+        exit 127
+    fi
+}
+
+require_command docker
+require_command curl
+require_command openssl
+require_command pnpm
+
+echo "Building the Fastify gateway..."
+(
+    cd "$repo_root"
+    pnpm --filter api-gateway build
+)
+
+echo "Starting the Fastify source entrypoint on 127.0.0.1:8080..."
+(
+    cd "$repo_root"
+    exec env \
+        NODE_ENV=test \
+        STORAGE_DRIVER=memory \
+        HOST=0.0.0.0 \
+        PORT=8080 \
+        TRUSTED_PROXY_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1 \
+        BUILD_SHA=nginx-validation \
+        "$repo_root/apps/api-gateway/node_modules/.bin/tsx" apps/api-gateway/src/server.ts >"$temp_dir/api.log" 2>&1
+) &
+api_pid=$!
+
+api_ready=0
+for _ in $(seq 1 60); do
+    if curl -fsS http://127.0.0.1:8080/api/v2/internal/health >/dev/null 2>&1; then
+        api_ready=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "$api_ready" != "1" ]; then
+    echo "Fastify did not become healthy. Logs:" >&2
+    sed -n '1,160p' "$temp_dir/api.log" >&2
+    exit 1
+fi
+
+echo "Building the Nginx validation image..."
+(
+    cd "$repo_root"
+    docker build --file deploy/docker/Dockerfile.nginx --tag "$image_name" .
+)
+
+echo "Checking the rendered staging profile..."
+docker run --rm \
+    --env NGINX_PROFILE=staging \
+    --env FASTIFY_UPSTREAM=host.docker.internal:8080 \
+    --env PORT=8081 \
+    --env NGINX_SERVER_NAME=localhost \
+    --env NGINX_READINESS_TOKEN=local-validation-readiness-token \
+    --env NGINX_FORWARDED_PROTO=http \
+    --env NGINX_VALIDATE_ONLY=1 \
+    --add-host host.docker.internal:host-gateway \
+    "$image_name"
+
+echo "Checking the rendered production profile with an ephemeral test certificate..."
+openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout "$temp_dir/test.key" \
+    -out "$temp_dir/test.crt" \
+    -subj '/CN=localhost.test' \
+    -days 1 >/dev/null 2>&1
+docker run --rm \
+    --env NGINX_PROFILE=production \
+    --env FASTIFY_UPSTREAM=host.docker.internal:8080 \
+    --env NGINX_HTTP_PORT=80 \
+    --env NGINX_HTTPS_PORT=443 \
+    --env NGINX_SERVER_NAME=localhost.test \
+    --env NGINX_READINESS_TOKEN=local-validation-readiness-token \
+    --env NGINX_TLS_CERTIFICATE=/tmp/c1rcle-test.crt \
+    --env NGINX_TLS_CERTIFICATE_KEY=/tmp/c1rcle-test.key \
+    --env NGINX_VALIDATE_ONLY=1 \
+    --volume "$temp_dir/test.crt:/tmp/c1rcle-test.crt:ro" \
+    --volume "$temp_dir/test.key:/tmp/c1rcle-test.key:ro" \
+    --add-host host.docker.internal:host-gateway \
+    "$image_name"
+
+# host.docker.internal resolves to an IPv4 address and, on Docker Desktop, an
+# IPv6 one that is unreachable. nginx round-robins across both, so which request
+# lands on the dead address depends on how many requests came before it, and one
+# unlucky request marks the whole upstream down for 10s (a spurious 502). The
+# live container therefore targets the IPv4 address directly.
+upstream_ipv4=$(docker run --rm --add-host host.docker.internal:host-gateway \
+    --entrypoint getent "$image_name" ahostsv4 host.docker.internal 2>/dev/null | awk 'NR==1 {print $1}')
+upstream_host="${upstream_ipv4:-host.docker.internal}"
+
+echo "Starting Nginx in front of Fastify..."
+docker run --detach --rm \
+    --name "$container_name" \
+    --add-host host.docker.internal:host-gateway \
+    --publish 18081:8081 \
+    --env NGINX_PROFILE=staging \
+    --env "FASTIFY_UPSTREAM=${upstream_host}:8080" \
+    --env PORT=8081 \
+    --env NGINX_SERVER_NAME=localhost \
+    --env NGINX_ADDITIONAL_SERVER_NAMES=extra.localhost.test \
+    --env NGINX_ORIGIN_VERIFY_SECRET=local-validation-origin-secret-0123456789abcdef \
+    --env NGINX_ORIGIN_LOCKED_SERVER_NAMES=extra.localhost.test \
+    --env NGINX_READINESS_TOKEN=local-validation-readiness-token \
+    --env NGINX_FORWARDED_PROTO=http \
+    "$image_name" >/dev/null
+
+nginx_ready=0
+for _ in $(seq 1 30); do
+    if curl -fsS http://localhost:18081/api/v2/internal/health >/dev/null 2>&1; then
+        nginx_ready=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "$nginx_ready" != "1" ]; then
+    echo "Nginx did not become healthy. Container logs:" >&2
+    docker logs "$container_name" >&2
+    exit 1
+fi
+
+echo "Checking safe Nginx reload..."
+docker exec "$container_name" nginx -s reload
+sleep 1
+curl -fsS http://localhost:18081/api/v2/internal/health >/dev/null
+
+echo "Checking health proxying and request-id response..."
+health_response=$(curl -fsS -D "$temp_dir/health.headers" http://localhost:18081/api/v2/internal/health)
+request_id=$(sed -n 's/^X-Request-Id: *//Ip' "$temp_dir/health.headers" | tr -d '\r' | head -n 1)
+
+if [ -z "$request_id" ]; then
+    echo "Expected Nginx to return X-Request-Id" >&2
+    exit 1
+fi
+
+case "$health_response" in
+    *"healthy"*|*"ok"*|*"status"*) : ;;
+    *)
+        echo "Unexpected health response: $health_response" >&2
+        exit 1
+        ;;
+esac
+
+echo "Checking the host allow-list (canonical name, additional name, unknown name)..."
+origin_secret='local-validation-origin-secret-0123456789abcdef'
+# extra.localhost.test is also origin-locked: it is served only with the secret.
+extra_host_status=$(curl -sS -o /dev/null -w '%{http_code}' -H 'Host: extra.localhost.test' \
+    -H "X-Origin-Verify: $origin_secret" \
+    http://localhost:18081/api/v2/internal/health)
+if [ "$extra_host_status" != "200" ]; then
+    echo "Expected the additional server name to be served with the secret, got $extra_host_status" >&2
+    exit 1
+fi
+echo "Checking the origin lock and the verified client IP..."
+for lock_headers in "" "X-Origin-Verify: wrong-secret-wrong-secret-wrong-secret-xx"; do
+    # The platform health probe is the one request a locked host serves without the
+    # secret (Render probes through the custom domain and cannot send it). GET and
+    # HEAD of exactly /api/v2/internal/health only.
+    for health_method in GET HEAD; do
+        # curl must be told HEAD with --head: `-X HEAD` waits for a body that a HEAD
+        # response never has and fails with "transfer closed" (curl error 18).
+        health_method_flag="-X GET"
+        if [ "$health_method" = "HEAD" ]; then health_method_flag="--head"; fi
+        # shellcheck disable=SC2086 # the flag is intentionally split into words
+        health_status=$(curl -sS -o /dev/null -w '%{http_code}' $health_method_flag \
+            -H 'Host: extra.localhost.test' ${lock_headers:+-H "$lock_headers"} \
+            http://localhost:18081/api/v2/internal/health)
+        if [ "$health_status" != "200" ]; then
+            echo "Expected $health_method of the health path on a locked host to be served without the secret, got $health_status" >&2
+            exit 1
+        fi
+    done
+    # Everything else on a locked host stays refused without a valid secret: other
+    # internal paths, the API itself, an unknown path, a different method on the
+    # health path, a trailing slash, and a traversal that normalises to readiness.
+    for locked_probe in \
+        'GET /api/v2/internal/readiness' \
+        'GET /api/v2/internal/version' \
+        'GET /api/v2/auth/session' \
+        'GET /api/v2/anything-else' \
+        'GET /' \
+        'POST /api/v2/internal/health' \
+        'GET /api/v2/internal/health/' \
+        'GET /api/v2/internal/health/../readiness'; do
+        probe_method="${locked_probe%% *}"
+        probe_path="${locked_probe#* }"
+        locked_status=$(curl -sS --path-as-is -o /dev/null -w '%{http_code}' -X "$probe_method" \
+            -H 'Host: extra.localhost.test' ${lock_headers:+-H "$lock_headers"} \
+            "http://localhost:18081$probe_path")
+        if [ "$locked_status" != "403" ]; then
+            echo "Expected $locked_probe on a locked host without a valid secret to return 403, got $locked_status" >&2
+            exit 1
+        fi
+    done
+done
+# A forged address with no secret must be ignored; a proven one must be used.
+curl -sS -o /dev/null -H 'X-C1-Client-IP: 198.51.100.66' http://localhost:18081/api/v2/internal/health
+curl -sS -o /dev/null -H 'Host: extra.localhost.test' -H "X-Origin-Verify: $origin_secret" \
+    -H 'X-C1-Client-IP: 203.0.113.77' http://localhost:18081/api/v2/internal/health
+curl -sS -o /dev/null -H 'Host: extra.localhost.test' -H "X-Origin-Verify: $origin_secret" \
+    -H 'X-C1-Client-IP: 1.2.3.4; not-an-ip' http://localhost:18081/api/v2/internal/health
+sleep 1
+ip_logs=$(docker logs "$container_name" 2>&1)
+case "$ip_logs" in
+    *'198.51.100.'*)
+        echo "An unverified X-C1-Client-IP was trusted as the client address" >&2
+        exit 1
+        ;;
+esac
+# The proven address is used (rate limits, Fastify) but the LOG carries only its
+# /24: client addresses are personal data and the platform retains logs.
+case "$ip_logs" in
+    *'"clientIp":"203.0.113.0"'*'"originVerified":1'*) : ;;
+    *)
+        echo "Expected the verified client address to be logged as its anonymised /24" >&2
+        exit 1
+        ;;
+esac
+case "$ip_logs" in
+    *'203.0.113.77'*)
+        echo "A full client address reached the access log; it must be anonymised" >&2
+        exit 1
+        ;;
+esac
+case "$ip_logs" in
+    *'not-an-ip'*)
+        echo "A malformed client address reached the logs" >&2
+        exit 1
+        ;;
+esac
+# An unknown Host must be dropped (444 closes the connection, so curl reports
+# an empty reply / code 000) and never reach Fastify.
+if unknown_host_status=$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -H 'Host: not-allowed.test' \
+    http://localhost:18081/api/v2/internal/health 2>/dev/null); then
+    echo "Expected an unknown Host to be refused, got $unknown_host_status" >&2
+    exit 1
+fi
+echo "Checking that malformed additional server names fail closed..."
+for bad_names in '*.wildcard.test' 'a.test;return 200' 'https://a.test/x' 'localhost'; do
+    if docker run --rm \
+        --env NGINX_PROFILE=staging \
+        --env FASTIFY_UPSTREAM=host.docker.internal:8080 \
+        --env PORT=8081 \
+        --env NGINX_SERVER_NAME=localhost \
+        --env NGINX_READINESS_TOKEN=local-validation-readiness-token \
+        --env NGINX_FORWARDED_PROTO=http \
+        --env "NGINX_ADDITIONAL_SERVER_NAMES=$bad_names" \
+        --env NGINX_VALIDATE_ONLY=1 \
+        --add-host host.docker.internal:host-gateway \
+        "$image_name" >/dev/null 2>&1; then
+        echo "Expected NGINX_ADDITIONAL_SERVER_NAMES=$bad_names to be rejected" >&2
+        exit 1
+    fi
+done
+
+echo "Checking that malformed origin-lock settings fail closed..."
+# Each entry is "SECRET|LOCKED_NAMES". Every one of these must be refused:
+# a secret that is too short, contains a quote or a semicolon, a locked host
+# with no secret at all, and a locked host this edge does not serve.
+for bad_lock in \
+    'too-short|' \
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"bbb|' \
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;bbb|' \
+    '|localhost' \
+    'local-validation-origin-secret-0123456789abcdef|elsewhere.test'; do
+    bad_secret="${bad_lock%%|*}"
+    bad_locked="${bad_lock#*|}"
+    if docker run --rm \
+        --env NGINX_PROFILE=staging \
+        --env FASTIFY_UPSTREAM=host.docker.internal:8080 \
+        --env PORT=8081 \
+        --env NGINX_SERVER_NAME=localhost \
+        --env NGINX_READINESS_TOKEN=local-validation-readiness-token \
+        --env NGINX_FORWARDED_PROTO=http \
+        --env "NGINX_ORIGIN_VERIFY_SECRET=$bad_secret" \
+        --env "NGINX_ORIGIN_LOCKED_SERVER_NAMES=$bad_locked" \
+        --env NGINX_VALIDATE_ONLY=1 \
+        --add-host host.docker.internal:host-gateway \
+        "$image_name" >/dev/null 2>&1; then
+        echo "Expected origin-lock settings [$bad_secret] [$bad_locked] to be rejected" >&2
+        exit 1
+    fi
+done
+
+echo "Checking readiness token gate..."
+readiness_no_token=$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:18081/api/v2/internal/readiness)
+if [ "$readiness_no_token" != "404" ]; then
+    echo "Expected readiness without a token to return 404, got $readiness_no_token" >&2
+    exit 1
+fi
+readiness_wrong_token=$(curl -sS -o /dev/null -w '%{http_code}' -H 'X-Readiness-Token: wrong-guess' http://localhost:18081/api/v2/internal/readiness)
+if [ "$readiness_wrong_token" != "404" ]; then
+    echo "Expected readiness with a wrong token to return 404, got $readiness_wrong_token" >&2
+    exit 1
+fi
+readiness_right_token=$(curl -sS -o /dev/null -w '%{http_code}' -H 'X-Readiness-Token: local-validation-readiness-token' http://localhost:18081/api/v2/internal/readiness)
+if [ "$readiness_right_token" != "200" ]; then
+    echo "Expected readiness with the correct token to return 200, got $readiness_right_token" >&2
+    exit 1
+fi
+
+echo "Checking access-log query redaction and no-store headers..."
+query_sentinel="query-log-sentinel-$$"
+curl -fsS -D "$temp_dir/query.headers" -o /dev/null \
+    "http://localhost:18081/api/v2/internal/health?token=$query_sentinel"
+container_logs=$(docker logs "$container_name" 2>&1)
+case "$container_logs" in
+    *"$query_sentinel"*)
+    echo "A query-string sentinel appeared in the Nginx access log" >&2
+    exit 1
+    ;;
+esac
+if ! rg -qi '^Cache-Control: *no-store' "$temp_dir/query.headers"; then
+    echo "Expected API responses to include Cache-Control: no-store" >&2
+    exit 1
+fi
+
+echo "Checking request-id correlation through Fastify..."
+error_headers="$temp_dir/error.headers"
+error_body=$(curl -sS -D "$error_headers" -H 'X-Request-Id: client-supplied-id-must-be-replaced' \
+    http://localhost:18081/api/v2/route-that-does-not-exist)
+edge_request_id=$(sed -n 's/^X-Request-Id: *//Ip' "$error_headers" | tr -d '\r' | head -n 1)
+
+if [ -z "$edge_request_id" ] || [ "$edge_request_id" = "client-supplied-id-must-be-replaced" ]; then
+    echo "Expected Nginx to issue a fresh request id" >&2
+    exit 1
+fi
+
+case "$error_body" in
+    *"$edge_request_id"*) : ;;
+    *)
+        echo "Fastify response did not preserve the edge request id: $error_body" >&2
+        exit 1
+        ;;
+esac
+
+echo "Checking edge body-size protection..."
+head -c 1100000 /dev/zero >"$temp_dir/oversized-body"
+oversized_status=$(curl -sS -o "$temp_dir/oversized-response" -w '%{http_code}' \
+    -X POST --data-binary "@$temp_dir/oversized-body" \
+    http://localhost:18081/api/v2/edge-validation)
+
+if [ "$oversized_status" != "413" ]; then
+    echo "Expected 413 for an oversized request, received $oversized_status" >&2
+    exit 1
+fi
+
+echo "Checking edge rate protection..."
+rate_limited=0
+for _ in $(seq 1 40); do
+    status=$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:18081/api/v2/route-that-does-not-exist)
+    if [ "$status" = "429" ]; then
+        rate_limited=1
+        break
+    fi
+done
+
+if [ "$rate_limited" != "1" ]; then
+    echo "Expected the edge rate limiter to return 429" >&2
+    exit 1
+fi
+
+echo "Checking upstream-unavailable JSON behavior..."
+kill "$api_pid"
+wait "$api_pid" >/dev/null 2>&1
+api_pid=""
+
+upstream_status=$(curl -sS -o "$temp_dir/upstream-response" -w '%{http_code}' \
+    http://localhost:18081/api/v2/internal/health)
+
+case "$upstream_status" in
+    502|503|504) : ;;
+    *)
+        echo "Expected an upstream failure status, received $upstream_status" >&2
+        exit 1
+        ;;
+esac
+
+case "$(sed 's/[[:space:]]//g' "$temp_dir/upstream-response")" in
+    *edge_upstream_unavailable*|*edge_upstream_timeout*) : ;;
+    *)
+        echo "Expected a structured upstream failure response" >&2
+        cat "$temp_dir/upstream-response" >&2
+        exit 1
+        ;;
+esac
+
+echo "Checking bounded mutation failures with retries disabled..."
+for method in POST PUT PATCH DELETE; do
+    mutation_status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+        -X "$method" http://localhost:18081/api/v2/internal/health || true)
+    case "$mutation_status" in
+        502|503|504) : ;;
+        *)
+            echo "Expected bounded $method upstream failure, received $mutation_status" >&2
+            exit 1
+            ;;
+    esac
+done
+
+echo "Nginx local validation passed."

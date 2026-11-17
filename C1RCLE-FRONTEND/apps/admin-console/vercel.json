@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "buildCommand": "cd ../.. && pnpm turbo run build --filter=@c1rcle/app-admin-console",
+  "installCommand": "cd ../.. && pnpm install --frozen-lockfile",
+  "outputDirectory": ".next",
+  "github": {
+    "silent": true
+  },
+  "git": {
+    "deploymentEnabled": {
+      "codex/m4-connected-payments-20261104": false,
+      "codex/eod-consolidated-20261104": false
+    }
+  }
+}

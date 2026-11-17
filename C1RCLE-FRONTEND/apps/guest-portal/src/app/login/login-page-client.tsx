@@ -1,0 +1,168 @@
+'use client';
+
+import Link from 'next/link';
+import { useSearchParams } from 'next/navigation';
+import React, { useState } from 'react';
+
+import { isApiClientError } from '@c1rcle/api-client';
+import { login, useSessionStore } from '@c1rcle/auth';
+
+import { GoogleButton } from '@/features/auth/components/GoogleButton';
+import { guestContinuePath } from '@/lib/auth/continue-path';
+import { captureGuestReturnFragment } from '@/lib/auth/return-fragment';
+import { safeNextPath } from '@/lib/auth/safe-next-path';
+
+import {
+  AuthShell,
+  authButtonClass,
+  authInputClass,
+} from '../../features/auth/components/AuthShell';
+
+function describeLoginError(error: unknown): string {
+  if (isApiClientError(error) && error.status === 429) {
+    return 'Too many attempts. Please wait a moment and try again.';
+  }
+  if (error instanceof Error && error.message === 'Authentication failed') {
+    return 'Incorrect email or password.';
+  }
+  if (isApiClientError(error) && error.status !== undefined && error.status >= 500) {
+    return 'Sign-in is temporarily unavailable. Please try again shortly.';
+  }
+  if (error instanceof TypeError || (isApiClientError(error) && error.status === undefined)) {
+    return 'We could not reach sign-in. Check your connection and try again.';
+  }
+  return 'We could not sign you in. Check your details and try again.';
+}
+
+export function LoginPageClient({
+  suggestedEmail = '',
+}: { readonly suggestedEmail?: string } = {}) {
+  const searchParams = useSearchParams();
+  const [email, setEmail] = useState(suggestedEmail);
+  const [password, setPassword] = useState('');
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const expired = searchParams.get('reason') === 'expired';
+  const nextPath = safeNextPath(searchParams.get('next'), '/explore');
+
+  const handleSubmit = async (event: React.SyntheticEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (pending) return;
+    setError(null);
+    setPending(true);
+    try {
+      await login({ email: email.trim(), password });
+      captureGuestReturnFragment(nextPath);
+      const user = useSessionStore.getState().session?.user;
+      // Read the new session in a fresh document while preserving the trusted
+      // verification/onboarding continuation and any ticket return fragment.
+      globalThis.location.assign(
+        user?.emailVerified === false
+          ? `/verify-email?next=${encodeURIComponent(nextPath)}`
+          : guestContinuePath(nextPath),
+      );
+    } catch (caught) {
+      setError(describeLoginError(caught));
+      setPending(false);
+    }
+  };
+
+  return (
+    <AuthShell eyebrow="Member access" title="Sign in">
+      {expired && !error && (
+        <p role="status" className="mb-5 text-sm text-white/60">
+          Your session expired. Sign in again to continue.
+        </p>
+      )}
+      <GoogleButton next={nextPath} />
+      {searchParams.get('reason') === 'google' && (
+        <p role="alert" className="mb-4 text-sm text-red-300">
+          Google sign-in was not completed. Try again, or sign in with your email to connect your
+          account.
+        </p>
+      )}
+      <form
+        onSubmit={(event) => {
+          void handleSubmit(event);
+        }}
+        className="space-y-5"
+        noValidate
+      >
+        <div className="space-y-2">
+          <label
+            htmlFor="login-email"
+            className="text-xs font-bold uppercase tracking-widest text-white/60"
+          >
+            Email address
+          </label>
+          <input
+            id="login-email"
+            type="email"
+            autoComplete="email"
+            required
+            value={email}
+            onChange={(event) => {
+              setEmail(event.target.value);
+              setError(null);
+            }}
+            className={authInputClass}
+            placeholder="you@example.com"
+          />
+        </div>
+        <div className="space-y-2">
+          <label
+            htmlFor="login-password"
+            className="text-xs font-bold uppercase tracking-widest text-white/60"
+          >
+            Password
+          </label>
+          <input
+            id="login-password"
+            type="password"
+            autoComplete="current-password"
+            required
+            value={password}
+            onChange={(event) => {
+              setPassword(event.target.value);
+              setError(null);
+            }}
+            className={authInputClass}
+          />
+        </div>
+        {error !== null && (
+          <p role="alert" className="text-sm text-red-300">
+            {error}
+          </p>
+        )}
+        <button
+          type="submit"
+          className={authButtonClass}
+          disabled={pending || email.trim().length === 0 || password.length === 0}
+        >
+          {pending ? 'Signing in…' : 'Sign in'}
+        </button>
+      </form>
+      <div className="mt-6 flex flex-col gap-3 text-sm text-white/55">
+        <Link href="/forgot-password" className="underline hover:text-white">
+          Forgot your password?
+        </Link>
+        <Link
+          href={`/verify-email?next=${encodeURIComponent(nextPath)}`}
+          className="underline hover:text-white"
+        >
+          Finish email verification
+        </Link>
+        <p>
+          New to THE C1RCLE?{' '}
+          <Link
+            href={`/signup?next=${encodeURIComponent(nextPath)}`}
+            className="underline hover:text-white"
+          >
+            Create an account
+          </Link>
+        </p>
+      </div>
+    </AuthShell>
+  );
+}

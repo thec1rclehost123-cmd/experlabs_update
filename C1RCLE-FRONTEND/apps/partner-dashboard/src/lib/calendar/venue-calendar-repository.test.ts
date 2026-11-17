@@ -1,0 +1,184 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  calendarMonthKeys,
+  eventDatePartInIndia,
+  formatEventTimeRange,
+  mapVenueCalendar,
+  venueBlockTimeRange,
+} from './venue-calendar-repository';
+
+import type { VenueDto, VenueOperationalEventDto, VenueSlotDto } from '@c1rcle/contracts';
+
+const timestamp = '2026-09-01T00:00:00.000Z';
+const venue: VenueDto = {
+  id: 'venue-1',
+  organizationId: 'org-1',
+  name: 'The Circle Room',
+  slug: 'the-circle-room',
+  status: 'active',
+  description: '',
+  capacity: 300,
+  city: 'Mumbai',
+  version: 1,
+  createdAt: timestamp,
+  updatedAt: timestamp,
+};
+
+function slot(id: string, day: number, status: VenueSlotDto['status']): VenueSlotDto {
+  const date = `2026-09-${String(day).padStart(2, '0')}`;
+  return {
+    id,
+    venueId: venue.id,
+    label: `${status} night`,
+    startTime: `${date}T20:00:00.000Z`,
+    endTime: `${date}T23:30:00.000Z`,
+    recurring: false,
+    status,
+    capacityFor: null,
+    version: 1,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+}
+
+function event(
+  id: string,
+  day: number,
+  status: VenueOperationalEventDto['status'],
+): VenueOperationalEventDto {
+  const date = `2026-09-${String(day).padStart(2, '0')}`;
+  return {
+    id,
+    ownerType: 'host',
+    title: `Event ${id}`,
+    imageUrl: null,
+    hostName: 'Test Host',
+    venueId: venue.id,
+    venueName: venue.name,
+    status,
+    startAt: `${date}T14:30:00.000Z`,
+    endAt: `${date}T17:30:00.000Z`,
+    eventCapacity: 100,
+    venueCapacity: venue.capacity,
+    ticketUnitsIssued: 10,
+    rsvpUnitsIssued: 2,
+    expectedGuests: 12,
+    checkedInGuests: 3,
+    operationalCountsComplete: true,
+    baseStartingPricePaise: 5000,
+    currentStartingPricePaise: 3000,
+    isFree: false,
+  };
+}
+
+describe('venue calendar repository mapping', () => {
+  it('builds calendar states from the venue slot and event API contracts', () => {
+    const calendar = mapVenueCalendar({
+      monthKeys: ['2026-09'],
+      venue,
+      slots: [
+        slot('slot-open', 3, 'open'),
+        slot('slot-pending', 7, 'pending'),
+        slot('slot-booked', 4, 'booked'),
+        slot('slot-blocked', 5, 'blocked'),
+        slot('slot-cancelled', 6, 'cancelled'),
+      ],
+      events: [
+        {
+          ...event('published', 8, 'published'),
+          startAt: '2026-09-08T14:30:00.000Z',
+          endAt: '2026-09-08T17:30:00.000Z',
+        },
+        event('postponed', 9, 'postponed'),
+        event('cancelled', 10, 'cancelled'),
+        event('venue-draft', 11, 'draft'),
+      ],
+    });
+
+    const days = calendar.months[0]?.days ?? [];
+    expect(calendar.dataStatus).toBe('live');
+    expect(days[2]).toMatchObject({
+      state: 'available',
+      slots: [{ id: 'slot-open', status: 'available' }],
+    });
+    expect(days[3]?.state).toBe('confirmed');
+    expect(days[4]?.state).toBe('blocked');
+    expect(days[5]?.state).toBe('unavailable');
+    expect(days[6]).toMatchObject({
+      state: 'pending',
+      events: [],
+    });
+    expect(days[7]).toMatchObject({
+      state: 'confirmed',
+      events: [{ id: 'published', status: 'confirmed', time: '8:00 PM – 11:00 PM IST' }],
+    });
+    expect(days[8]).toMatchObject({
+      state: 'pending',
+      events: [
+        { id: 'postponed', status: 'pending', statusLabel: 'Postponed · original slot released' },
+      ],
+    });
+    expect(days[9]).toMatchObject({ state: 'unavailable', events: [] });
+    expect(days[10]).toMatchObject({ state: 'unavailable', events: [] });
+    expect(calendar.blocks).toEqual([
+      expect.objectContaining({ id: 'slot-blocked', date: '2026-09-05', reason: 'blocked night' }),
+    ]);
+  });
+
+  it('formats published availability in its stored timezone and keeps the venue note', () => {
+    const calendar = mapVenueCalendar({
+      monthKeys: ['2026-11'],
+      venue,
+      slots: [
+        {
+          ...slot('slot-venue-m15', 16, 'open'),
+          startTime: '2026-11-16T13:30:00.000Z',
+          endTime: '2026-11-16T17:30:00.000Z',
+          timezone: 'Asia/Kolkata',
+          notes: 'M15-VENUE-E2E-20261030',
+        },
+      ],
+      events: [],
+    });
+
+    expect(calendar.months[0]?.days[15]?.slots).toEqual([
+      {
+        id: 'slot-venue-m15',
+        label: 'open night · 7:00 PM IST – 11:00 PM IST',
+        status: 'available',
+        startTime: '2026-11-16T13:30:00.000Z',
+        endTime: '2026-11-16T17:30:00.000Z',
+        timezone: 'Asia/Kolkata',
+        notes: 'M15-VENUE-E2E-20261030',
+      },
+    ]);
+  });
+
+  it('creates a stable month window around an anchor month', () => {
+    expect(calendarMonthKeys('2026-01', 1, 2)).toEqual([
+      '2025-12',
+      '2026-01',
+      '2026-02',
+      '2026-03',
+    ]);
+  });
+
+  it('builds same-day and overnight block ranges', () => {
+    expect(venueBlockTimeRange({ date: '2026-09-17', from: '19:00', to: '23:00' })).toEqual({
+      startTime: '2026-09-17T13:30:00.000Z',
+      endTime: '2026-09-17T17:30:00.000Z',
+    });
+    expect(venueBlockTimeRange({ date: '2026-09-17', from: '23:00', to: '02:00' })).toEqual({
+      startTime: '2026-09-17T17:30:00.000Z',
+      endTime: '2026-09-17T20:30:00.000Z',
+    });
+  });
+
+  it('shows stored UTC event instants in India venue time', () => {
+    expect(eventDatePartInIndia('2026-11-06T19:30:00.000Z')).toBe('2026-11-07');
+    expect(formatEventTimeRange('2026-11-07T14:30:00.000Z', '2026-11-07T17:30:00.000Z')).toBe(
+      '8:00 PM – 11:00 PM IST',
+    );
+  });
+});

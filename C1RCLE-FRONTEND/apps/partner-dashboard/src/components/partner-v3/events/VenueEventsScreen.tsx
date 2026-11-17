@@ -1,0 +1,42 @@
+import { PartnerEventsScreen } from './PartnerEventsScreen';
+
+import type { PartnerEventParty, VenueEventsData } from '@/data/partner-data-source';
+
+const venueEventsConfig = {
+  accent: 'orange',
+  analyticsHref: '/partner/venue/analytics',
+  createEventHref: '/partner/venue/events/create',
+  defaultParty: 'all',
+  eventsBaseHref: '/partner/venue/events',
+  eventSectionLabel: 'Venue',
+  partyFilterLabel: 'Event ownership',
+  showViewToggle: true,
+  showAllPartyFilter: true,
+  slotRequestsHref: '/partner/venue/slot-requests',
+  hideDraftsForHostParty: true,
+} as const;
+
+export function VenueEventsScreen({
+  data,
+  initialSearch,
+  initialStatus,
+  initialParty,
+  initialView,
+}: {
+  readonly data: VenueEventsData;
+  readonly initialSearch?: string;
+  readonly initialStatus?: 'all' | 'Live' | 'Draft' | 'Completed';
+  readonly initialParty?: PartnerEventParty;
+  readonly initialView?: 'list' | 'grid';
+}) {
+  return (
+    <PartnerEventsScreen
+      config={venueEventsConfig}
+      data={data}
+      initialSearch={initialSearch}
+      initialStatus={initialStatus}
+      initialParty={initialParty}
+      initialView={initialView}
+    />
+  );
+}

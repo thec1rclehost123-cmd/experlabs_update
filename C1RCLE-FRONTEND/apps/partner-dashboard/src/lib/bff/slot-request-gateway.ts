@@ -1,0 +1,706 @@
+/*
+ * Server-side gateway composer for the slot-request feature. This is the only
+ * module on the slot-request path allowed to talk to the gateway (via the
+ * sanctioned `forwardToGateway` in `auth-proxy.ts`): the `/api/bff/slot-requests`
+ * route handlers are thin wrappers around it, and caller org identity is
+ * forwarded server-side only — the browser never sees a gateway URL.
+ *
+ * GAP notes (honest, never invented data — see `docs/superpowers/
+ * FRONTEND-GATEWAY-BACKEND-MAP.md` §5.2):
+ *  - Ticket tiers / promos / tables / artists / promoters are catalog reads
+ *    that are not part of this slice; the affected UI sections render only when
+ *    the wire actually provided something (empty lists are dropped).
+ *  - `accepted` (wire) is mapped to `approved` (UI) so the surface keeps its
+ *    established status vocabulary.
+ */
+import { getClientEnv } from '@c1rcle/config';
+import { PRODUCT_TIME_ZONE } from '@c1rcle/contracts';
+
+import { forwardToGateway, mintIdempotencyKey, parseJson } from './auth-proxy';
+
+import type {
+  SlotRequest,
+  SlotRequestDirection,
+  SlotRequestEvent,
+  SlotRequestStatus,
+  SlotRequestsData,
+} from '@/data/partner-data-source';
+import type {
+  EventDto,
+  Paginated,
+  PartnershipDto,
+  SlotRequestDetailDto,
+  SlotRequestDto,
+  VenueDto,
+} from '@c1rcle/contracts';
+
+export interface GatewayContext {
+  readonly cookie: string | null;
+  readonly headers: Readonly<Record<string, string>>;
+}
+
+export class GatewayError extends Error {
+  readonly status: number;
+  readonly envelope: unknown;
+
+  constructor(status: number, envelope: unknown) {
+    const message =
+      typeof envelope === 'object' &&
+      envelope !== null &&
+      typeof (envelope as { message?: unknown }).message === 'string'
+        ? String((envelope as { message: unknown }).message)
+        : `Gateway responded with status ${String(status)}.`;
+    super(message);
+    this.name = 'GatewayError';
+    this.status = status;
+    this.envelope = envelope;
+  }
+}
+
+/** Forward headers for a gateway call scoped to the requested organization. */
+function gatewayHeaders(organizationId: string, ctx: GatewayContext): Record<string, string> {
+  return {
+    ...ctx.headers,
+    'x-organization-id': organizationId,
+  };
+}
+
+/**
+ * The gateway requires an `Idempotency-Key` on every slot-request write
+ * (create, accept, reject, cancel) — a missing header is a 422. Mint one per
+ * transition so a client retry replays the recorded result instead of the
+ * gateway re-running the command.
+ */
+function withIdempotency(ctx: GatewayContext): GatewayContext {
+  return { ...ctx, headers: { ...ctx.headers, 'Idempotency-Key': mintIdempotencyKey() } };
+}
+
+/** Gateway calls must resolve quickly — a fossilised gateway is surfaced as a
+ * fast `GatewayError` instead of hanging the BFF until the browser aborts. */
+const GATEWAY_TIMEOUT_MS = 10_000;
+// Accepting an event request can publish its event, tiers, promotions, and
+// assignments. Give writes the same response window as the browser API client.
+const GATEWAY_ACTION_TIMEOUT_MS = 60_000;
+
+async function gatewayGet<T>(
+  path: string,
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<T> {
+  let response: Response;
+  try {
+    response = await forwardToGateway(path, {
+      method: 'GET',
+      cookie: ctx.cookie,
+      headers: gatewayHeaders(organizationId, ctx),
+      signal: AbortSignal.timeout(GATEWAY_TIMEOUT_MS),
+    });
+  } catch {
+    throw new GatewayError(504, {
+      code: 'server',
+      message: 'The venue service did not respond in time.',
+      status: 504,
+    });
+  }
+  const bodyText = await response.text();
+  if (!response.ok) {
+    throw new GatewayError(response.status, safeParse(bodyText));
+  }
+  if (bodyText.length === 0) return undefined as T;
+  return parseJson(bodyText) as T;
+}
+
+async function gatewayPost<T>(
+  path: string,
+  organizationId: string,
+  body: Record<string, unknown>,
+  ctx: GatewayContext,
+): Promise<T> {
+  let response: Response;
+  try {
+    response = await forwardToGateway(path, {
+      method: 'POST',
+      body,
+      cookie: ctx.cookie,
+      headers: gatewayHeaders(organizationId, ctx),
+      signal: AbortSignal.timeout(GATEWAY_ACTION_TIMEOUT_MS),
+    });
+  } catch {
+    throw new GatewayError(504, {
+      code: 'server',
+      message: 'The venue service did not respond in time.',
+      status: 504,
+    });
+  }
+  const bodyText = await response.text();
+  if (!response.ok) {
+    throw new GatewayError(response.status, safeParse(bodyText));
+  }
+  if (bodyText.length === 0) return undefined as T;
+  return parseJson(bodyText) as T;
+}
+
+function safeParse(bodyText: string): unknown {
+  try {
+    return JSON.parse(bodyText) as unknown;
+  } catch {
+    return { code: 'server', message: 'Gateway returned a non-JSON error.', status: 500 };
+  }
+}
+
+/* ─── Wire → UI mapping ─────────────────────────────────────────────────── */
+
+function mapStatus(status: SlotRequestDto['status']): SlotRequestStatus {
+  switch (status) {
+    case 'pending':
+      return 'pending';
+    case 'accepted':
+      return 'approved';
+    case 'rejected':
+      return 'rejected';
+    case 'cancelled':
+      return 'cancelled';
+  }
+}
+
+function partnerInitials(name: string): string {
+  const words = name.split(/\s+/).filter(Boolean).slice(0, 2);
+  return words.map((word) => word[0]?.toUpperCase() ?? '').join('') || '?';
+}
+
+/** Renders an ISO timestamp as a short weekday/date label in IST. */
+function formatDate(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleDateString('en-IN', {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    timeZone: PRODUCT_TIME_ZONE,
+  });
+}
+
+/** Renders a start/end ISO pair in the fixed product timezone. */
+function formatTime(startAt: string, endAt: string | null): string {
+  const start = new Date(startAt);
+  const end = endAt ? new Date(endAt) : null;
+  if (Number.isNaN(start.getTime())) return '—';
+  const options: Intl.DateTimeFormatOptions = {
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: PRODUCT_TIME_ZONE,
+  };
+  const startLabel = start.toLocaleTimeString('en-IN', options);
+  if (!end || Number.isNaN(end.getTime())) return startLabel;
+  return `${startLabel} – ${end.toLocaleTimeString('en-IN', options)}`;
+}
+
+function formatSlotTime(
+  startAt: string,
+  endAt: string | null,
+  _timezone: string | null | undefined,
+): string {
+  return formatTime(startAt, endAt);
+}
+
+function toUiEvent(
+  event: EventDto | null,
+  message: string | undefined,
+  venueName: string,
+  titleFallback: string,
+): SlotRequestEvent {
+  if (!event) {
+    return {
+      name: titleFallback,
+      description: 'The linked event is no longer available.',
+      date: '—',
+      time: '—',
+      venue: venueName,
+      ...(message ? { note: message } : {}),
+    };
+  }
+  return {
+    name: event.title,
+    description:
+      (event.summary || event.description || '').trim() || 'No description provided yet.',
+    imageUrl: event.imageUrl,
+    date: formatDate(event.startAt),
+    time: formatTime(event.startAt, event.endAt ?? null),
+    venue: venueName,
+    ...(message ? { note: message } : {}),
+    // GAP: ticket tiers / pricing / tables / codes / artists / promoters are
+    // catalog reads outside this slice — leave them absent so the UI hides the
+    // sections instead of showing invented numbers.
+  };
+}
+
+function toUiRequest(
+  dto: SlotRequestDto,
+  direction: SlotRequestDirection,
+  event: EventDto | null,
+  venueName: string,
+  partnerName: string,
+  partnerRoleLabel: 'Host' | 'Venue',
+  titleFallback: string,
+): SlotRequest {
+  return {
+    id: dto.id,
+    ...(dto.eventId ? { eventId: dto.eventId } : {}),
+    ...(dto.eventDraft ? { hasEventDraft: true } : {}),
+    ...(direction === 'outgoing' && dto.eventDraft ? { eventDraft: dto.eventDraft } : {}),
+    ...(event ? { linkedEventStatus: event.status } : {}),
+    status: mapStatus(dto.status),
+    direction,
+    partnerName,
+    partnerRoleLabel,
+    partnerInitials: partnerInitials(partnerName),
+    ...(dto.venueId ? { venueId: dto.venueId } : {}),
+    ...(dto.slotId ? { slotId: dto.slotId } : {}),
+    ...(dto.slotStartTime ? { slotStartTime: dto.slotStartTime } : {}),
+    ...(dto.slotEndTime ? { slotEndTime: dto.slotEndTime } : {}),
+    ...(dto.rejectionReason ? { rejectionReason: dto.rejectionReason } : {}),
+    timezone: PRODUCT_TIME_ZONE,
+    event: event
+      ? toUiEvent(event, dto.message, venueName, titleFallback)
+      : dto.eventDraft
+        ? {
+            name: dto.eventDraft.event.title,
+            description: (
+              dto.eventDraft.event.description ??
+              dto.eventDraft.event.summary ??
+              ''
+            ).trim(),
+            imageUrl: dto.eventDraft.event.imageUrl,
+            date: new Intl.DateTimeFormat('en-IN', {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric',
+              year: 'numeric',
+              timeZone: PRODUCT_TIME_ZONE,
+            }).format(new Date(dto.eventDraft.event.startAt)),
+            time: `${formatSlotTime(dto.eventDraft.event.startAt, dto.eventDraft.event.endAt ?? null, PRODUCT_TIME_ZONE)} IST`,
+            venue: venueName,
+            ticketTier: `${String(dto.eventDraft.tiers.length)} ticket tiers`,
+            ...(dto.message ? { note: dto.message } : {}),
+            artists: dto.eventDraft.event.tags,
+            promoters: dto.eventDraft.promoters.length
+              ? [
+                  `${String(dto.eventDraft.promoters.length)} Promoter${dto.eventDraft.promoters.length === 1 ? '' : 's'} selected`,
+                ]
+              : [],
+            tiers: dto.eventDraft.tiers.map(({ command }) => ({
+              name: command.name,
+              price:
+                command.accessType === 'RSVP' || command.priceInPaise === undefined
+                  ? 'Free RSVP'
+                  : new Intl.NumberFormat('en-IN', {
+                      style: 'currency',
+                      currency: 'INR',
+                      maximumFractionDigits: 2,
+                    }).format(command.priceInPaise / 100),
+              quantity: String(command.quantity),
+            })),
+            pricing: dto.eventDraft.tiers.flatMap(({ command }) =>
+              (command.pricingPhases ?? []).map(
+                (phase) =>
+                  `${command.name}: ${phase.name} · ${new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(phase.priceInPaise / 100)}`,
+              ),
+            ),
+            tables: `${String(dto.eventDraft.tiers.filter(({ command }) => command.accessType === 'TABLE').length)} table tiers`,
+            codes: `${String(dto.eventDraft.promotions.length)} promo codes`,
+          }
+        : dto.slotStartTime
+          ? {
+              name: 'Venue slot request',
+              description: 'Request for a published Venue availability slot.',
+              date: new Intl.DateTimeFormat('en-IN', {
+                weekday: 'short',
+                month: 'short',
+                day: 'numeric',
+                timeZone: PRODUCT_TIME_ZONE,
+              }).format(new Date(dto.slotStartTime)),
+              time: `${formatSlotTime(dto.slotStartTime, dto.slotEndTime ?? null, dto.timezone)} IST`,
+              venue: venueName,
+              ...(dto.message ? { note: dto.message } : {}),
+            }
+          : toUiEvent(null, dto.message, venueName, titleFallback),
+  };
+}
+
+/* ─── Reads ──────────────────────────────────────────────────────────────── */
+
+/**
+ * Incoming list for a venue organization: every slot request that landed on any
+ * of the org's venues, each enriched with the host's drafted event + requester
+ * name via the venue-owner detail endpoint.
+ */
+async function loadIncoming(
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<SlotRequestsData> {
+  const { entries, venues } = await fetchIncomingEntries(organizationId, ctx);
+  const venue = venues.find((item) => item.status === 'active') ?? venues[0];
+  const venueShareUrl = venue
+    ? `${getClientEnv().NEXT_PUBLIC_GUEST_PORTAL_URL.replace(/\/$/, '')}/venue/${encodeURIComponent(venue.slug)}`
+    : undefined;
+  return {
+    dataStatus: 'live',
+    accent: 'orange',
+    direction: 'incoming',
+    requests: entries.map((entry) => entry.request),
+    ...(venueShareUrl ? { venueShareUrl } : {}),
+  };
+}
+
+/**
+ * Outgoing list for a host organization: the requests it submitted, enriched
+ * with the host's own event and the target venue. Enrichment failures for a
+ * deleted target are tolerated so a historical request stays visible.
+ */
+async function loadOutgoing(
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<SlotRequestsData> {
+  const entries = await fetchOutgoingEntries(organizationId, ctx);
+  return {
+    dataStatus: 'live',
+    accent: 'lavender',
+    direction: 'outgoing',
+    requests: entries.map((entry) => entry.request),
+  };
+}
+
+interface SlotRequestEntry {
+  readonly createdAt: string;
+  readonly request: SlotRequest;
+}
+
+/** Runs `work` over `items` with at most `limit` in flight at once. */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  work: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  async function worker(): Promise<void> {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await work(items[index] as T);
+    }
+  }
+  const workers = new Array(Math.min(limit, items.length)).fill(null).map(() => worker());
+  await Promise.all(workers);
+  return results;
+}
+
+async function fetchIncomingEntries(
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<{ readonly entries: SlotRequestEntry[]; readonly venues: readonly VenueDto[] }> {
+  const venues = await gatewayGet<Paginated<VenueDto>>(
+    `/api/v2/organizations/${encodeURIComponent(organizationId)}/venues?limit=100`,
+    organizationId,
+    ctx,
+  );
+
+  const pages = await Promise.all(
+    venues.items.map((venue) =>
+      gatewayGet<Paginated<SlotRequestDto>>(
+        `/api/v2/venues/${encodeURIComponent(venue.id)}/slot-requests?limit=100`,
+        organizationId,
+        ctx,
+      ),
+    ),
+  );
+
+  const byVenueId = new Map(venues.items.map((venue) => [venue.id, venue]));
+  const requests: { venueId: string; dto: SlotRequestDto }[] = [];
+  for (const [venueIndex, page] of pages.entries()) {
+    const venue = byVenueId.get(venues.items[venueIndex]?.id ?? '');
+    if (venue === undefined) continue;
+    for (const dto of page.items) {
+      requests.push({ venueId: venue.id, dto });
+    }
+  }
+
+  // Enrich with the venue-owner detail (event + requester name), parallel across
+  // requests rather than one gateway round-trip per request in a serial loop.
+  const details = await mapWithConcurrency(requests, 8, ({ venueId, dto }) =>
+    gatewayGet<SlotRequestDetailDto>(
+      `/api/v2/venues/${encodeURIComponent(venueId)}/slot-requests/${encodeURIComponent(dto.id)}`,
+      organizationId,
+      ctx,
+    ).catch(ignoreMissing),
+  );
+
+  const entries = requests.map(({ venueId, dto }, index) => {
+    const detail = details[index] ?? null;
+    const venueName = byVenueId.get(venueId)?.name ?? venueId;
+    return {
+      createdAt: dto.createdAt,
+      request: toUiRequest(
+        dto,
+        'incoming',
+        detail?.event ?? null,
+        venueName,
+        detail?.host?.name ?? dto.hostId,
+        'Host',
+        detail?.event?.title ?? 'Slot request',
+      ),
+    };
+  });
+
+  entries.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  return { entries, venues: venues.items };
+}
+
+async function fetchOutgoingEntries(
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<SlotRequestEntry[]> {
+  const page = await gatewayGet<Paginated<SlotRequestDto>>(
+    `/api/v2/organizations/${encodeURIComponent(organizationId)}/slot-requests?limit=100`,
+    organizationId,
+    ctx,
+  );
+
+  // Two bulk reads cover event enrichment and a venue lookup. The Host's
+  // organization-scoped venue list may be empty because the Host does not own
+  // the venue; active partnerships are the authoritative relationship and
+  // carry the public-safe venue name.
+  // Both are best-effort: a failed bulk read degrades enrichment (fallback
+  // names/titles) instead of failing the whole list, matching the old
+  // per-request `ignoreMissing` tolerance.
+  const [venuesById, eventsById] = await Promise.all([
+    gatewayGet<Paginated<PartnershipDto>>(
+      `/api/v2/organizations/${encodeURIComponent(organizationId)}/partnerships?limit=100`,
+      organizationId,
+      ctx,
+    )
+      .then(
+        (data) =>
+          new Map(
+            data.items.flatMap((partnership) =>
+              partnership.status === 'active' && partnership.venueName
+                ? [[partnership.venueId, partnership.venueName] as const]
+                : [],
+            ),
+          ),
+      )
+      .catch(() => new Map<string, string>()),
+    gatewayGet<Paginated<EventDto>>(
+      `/api/v2/organizations/${encodeURIComponent(organizationId)}/events?limit=100`,
+      organizationId,
+      ctx,
+    )
+      .then((data) => new Map(data.items.map((event) => [event.id, event])))
+      .catch(() => new Map<string, EventDto>()),
+  ]);
+
+  const entries = page.items.map((dto) => {
+    const event = dto.eventId ? (eventsById.get(dto.eventId) ?? null) : null;
+    const venueName = dto.venueId
+      ? (venuesById.get(dto.venueId) ?? 'Venue name unavailable')
+      : 'Venue name unavailable';
+    return {
+      createdAt: dto.createdAt,
+      request: toUiRequest(
+        dto,
+        'outgoing',
+        event,
+        venueName,
+        venueName,
+        'Venue',
+        event?.title ?? 'Slot request',
+      ),
+    };
+  });
+
+  entries.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  return entries;
+}
+
+function ignoreMissing(error: unknown): null {
+  if (error instanceof GatewayError && error.status === 404) return null;
+  throw error;
+}
+
+export async function loadSlotRequestsData(
+  direction: SlotRequestDirection,
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<SlotRequestsData> {
+  return direction === 'incoming'
+    ? loadIncoming(organizationId, ctx)
+    : loadOutgoing(organizationId, ctx);
+}
+
+/* ─── Notifications (derived from slot-request statuses) ─────────────────── */
+
+type PartnerNotificationType = 'payout' | 'request' | 'marketing' | 'operations' | 'system';
+type PartnerNotificationIcon = 'finance' | 'partner' | 'marketing' | 'operations' | 'request';
+
+export interface PartnerNotificationDto {
+  readonly id: string;
+  readonly description: string;
+  readonly time: string;
+  readonly type: PartnerNotificationType;
+  readonly icon: PartnerNotificationIcon;
+  readonly href?: string;
+  readonly unread: boolean;
+}
+
+function relativeTime(createdAt: string): string {
+  const created = new Date(createdAt).getTime();
+  if (Number.isNaN(created)) return 'now';
+  const minutes = Math.max(1, Math.round((Date.now() - created) / 60000));
+  if (minutes < 60) return `${String(minutes)}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${String(hours)}h`;
+  return `${String(Math.floor(hours / 24))}d`;
+}
+
+function toNotification(entry: SlotRequestEntry): PartnerNotificationDto | null {
+  const request = entry.request;
+  const isIncoming = request.direction === 'incoming';
+  const base = {
+    time: relativeTime(entry.createdAt),
+    type: 'request' as const,
+    icon: 'request' as const,
+    unread: true,
+  };
+  if (request.status === 'pending' && isIncoming) {
+    return {
+      ...base,
+      id: `notif-${request.id}`,
+      description: `New slot request from ${request.partnerName}`,
+      href: `/partner/venue/slot-requests?request=${encodeURIComponent(request.id)}`,
+    };
+  }
+  if (request.status === 'approved' && !isIncoming) {
+    return {
+      ...base,
+      id: `notif-${request.id}`,
+      description: `Slot request accepted by ${request.partnerName}`,
+      href: `/partner/host/slot-requests?request=${encodeURIComponent(request.id)}`,
+    };
+  }
+  if (request.status === 'rejected' && !isIncoming) {
+    return {
+      ...base,
+      id: `notif-${request.id}`,
+      description: `Slot request declined by ${request.partnerName}`,
+      href: `/partner/host/slot-requests?request=${encodeURIComponent(request.id)}`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Derives the notification strip for a slate from real slot-request statuses —
+ * no guessed Phase-8 notification contract: venues see incoming *pending* asks,
+ * hosts see *accepted* and *rejected* outcomes on their outgoing requests.
+ */
+export async function loadSlotRequestNotifications(
+  direction: SlotRequestDirection,
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<PartnerNotificationDto[]> {
+  const entries =
+    direction === 'incoming'
+      ? (await fetchIncomingEntries(organizationId, ctx)).entries
+      : await fetchOutgoingEntries(organizationId, ctx);
+  return entries
+    .map(toNotification)
+    .filter((entry): entry is PartnerNotificationDto => entry !== null);
+}
+
+/* ─── Mutations ──────────────────────────────────────────────────────────── */
+
+export async function acceptSlotRequest(
+  slotRequestId: string,
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<SlotRequestDto> {
+  return gatewayPost<SlotRequestDto>(
+    `/api/v2/venues/slot-requests/${encodeURIComponent(slotRequestId)}/accept`,
+    organizationId,
+    {},
+    withIdempotency(ctx),
+  );
+}
+
+export async function rejectSlotRequest(
+  slotRequestId: string,
+  organizationId: string,
+  ctx: GatewayContext,
+  reason: string,
+): Promise<SlotRequestDto> {
+  return gatewayPost<SlotRequestDto>(
+    `/api/v2/venues/slot-requests/${encodeURIComponent(slotRequestId)}/reject`,
+    organizationId,
+    { reason },
+    withIdempotency(ctx),
+  );
+}
+
+export async function cancelSlotRequest(
+  slotRequestId: string,
+  organizationId: string,
+  ctx: GatewayContext,
+): Promise<SlotRequestDto> {
+  return gatewayPost<SlotRequestDto>(
+    `/api/v2/venues/slot-requests/${encodeURIComponent(slotRequestId)}/cancel`,
+
+    organizationId,
+    {},
+    withIdempotency(ctx),
+  );
+}
+
+/* ─── Host "submit for approval" workflow ────────────────────────────────── */
+
+export interface HostSlotRequestSubmitInput {
+  readonly organizationId: string;
+  readonly venueId: string;
+  readonly slotId: string;
+  readonly idempotencyKey: string;
+  readonly name: string;
+  /** YYYY-MM-DD. */
+  readonly date: string;
+  /** Twelve or twenty-four hour clock, e.g. "7:30 PM". */
+  readonly time: string;
+  readonly endTime?: string;
+  readonly dateLabel: string;
+  readonly genres: readonly string[];
+  readonly artists: readonly string[];
+  /** Public poster URL resolved on the client (null = gradient artwork). */
+  readonly posterPublicUrl?: string | null;
+}
+
+export interface HostSlotRequestSubmitResult {
+  readonly slotRequestId: string;
+}
+
+/**
+ * Creates only the slot request. A Host event is created in a separate flow
+ * after the Venue has accepted and reserved this slot.
+ */
+export async function submitHostSlotRequest(
+  input: HostSlotRequestSubmitInput,
+  ctx: GatewayContext,
+): Promise<HostSlotRequestSubmitResult> {
+  const { organizationId } = input;
+  const slotRequest = await gatewayPost<SlotRequestDto>(
+    `/api/v2/venues/${encodeURIComponent(input.venueId)}/slot-requests`,
+    organizationId,
+    {
+      slotId: input.slotId,
+      message: `Host request for "${input.name.trim()}" on ${input.dateLabel}`,
+    },
+    { ...ctx, headers: { ...ctx.headers, 'Idempotency-Key': input.idempotencyKey } },
+  );
+  return { slotRequestId: slotRequest.id };
+}

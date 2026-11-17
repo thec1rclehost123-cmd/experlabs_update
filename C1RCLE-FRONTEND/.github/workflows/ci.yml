@@ -1,0 +1,343 @@
+# ─── CI ───────────────────────────────────────────────────────────────────────
+# PR gate (lint/typecheck/test/build) runs on every pull request. A push to
+# main/staging is always a merge of a PR that already ran the gate — it does
+# NOT re-run the same checks. Instead it runs a different, merge-only
+# pipeline: build+serve Playwright e2e for all three apps, plus a live
+# post-deploy smoke check against the real Vercel URLs once Vercel's own
+# Git integration has deployed the new commit.
+name: CI
+
+on:
+  pull_request:
+    branches: [main, staging]
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+    inputs:
+      backend_ref:
+        description: Backend commit or branch for exact-pair contract parity
+        type: string
+        required: true
+        default: codex/m4-m5-lineage-reconcile-20261029
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ── PR gate ─────────────────────────────────────────────────────────────────
+  # One runner: format, lint (type-aware ESLint), typecheck, boundaries, unit
+  # tests, build — across every workspace via turbo. `if: always()` on each
+  # step so one run reports every failure instead of stopping at the first.
+  gate:
+    name: Lint, typecheck, test, build
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+
+      - name: Format
+        id: format
+        run: pnpm format:check
+
+      - name: Lint
+        id: lint
+        if: always()
+        run: pnpm exec turbo run lint --concurrency=1
+
+      - name: Typecheck
+        id: typecheck
+        if: always()
+        run: pnpm exec turbo run typecheck --concurrency=1
+
+      - name: Architecture boundaries
+        id: boundaries
+        if: always()
+        run: pnpm boundaries
+
+      - name: Test
+        id: test
+        if: always()
+        run: pnpm exec turbo run test:coverage --concurrency=1
+
+      # Each app validates its own env at build time (`@c1rcle/config`). CI has
+      # no real secrets to build against, so each app's own `.env.example`
+      # (placeholder values, safe to commit) stands in — same convention the
+      # `dev:staging` / `dev:prod` scripts already use locally, just pointed
+      # at the example file instead of a real one.
+      - name: Seed placeholder env for build
+        id: seed-env
+        if: always()
+        run: |
+          for app in guest-portal partner-dashboard admin-console; do
+            if [ -f "apps/$app/.env.example" ]; then
+              cp "apps/$app/.env.example" "apps/$app/.env.local"
+            fi
+          done
+
+      # scanner-app uses Expo's EXPO_PUBLIC_* convention (a different prefix
+      # and inlining mechanism than the Next.js apps' NEXT_PUBLIC_*/.env.local
+      # above), read via a plain .env file rather than app.config.ts's own
+      # process.env access — kept as its own step rather than folded into
+      # the loop above, which assumes one shared shape across all four apps.
+      - name: Seed placeholder env for scanner-app build
+        id: seed-env-scanner
+        if: always()
+        run: cp apps/scanner-app/.env.example apps/scanner-app/.env
+
+      # Expo native deps must stay inside the SDK 55 tested set. `expo install
+      # --check` fails on drift (e.g. react-native-screens pulled out of the
+      # ~4.23.0 range — a newer 4.x breaks the RN 0.83 codegen on CI with
+      # "SearchBarNativeComponent.ts: The first argument of method blur must be
+      # of type React.ElementRef<>"). Fix drift with `npx expo install <pkg>`,
+      # never a manual version bump. Runs before Build so a regression gets a
+      # clear, fast failure instead of a cryptic codegen error minutes later.
+      - name: Check Expo native deps stay in SDK range
+        id: expo-deps
+        if: always()
+        working-directory: apps/scanner-app
+        run: npx expo install --check
+
+      - name: Build
+        id: build
+        if: always()
+        run: pnpm exec turbo run build --concurrency=1
+
+      - name: Summarize
+        if: always()
+        run: |
+          {
+            echo "| Check | Result |"
+            echo "| --- | :--- |"
+            echo "| Format | ${{ steps.format.outcome }} |"
+            echo "| Lint | ${{ steps.lint.outcome }} |"
+            echo "| Typecheck | ${{ steps.typecheck.outcome }} |"
+            echo "| Boundaries | ${{ steps.boundaries.outcome }} |"
+            echo "| Test | ${{ steps.test.outcome }} |"
+            echo "| Expo deps | ${{ steps.expo-deps.outcome }} |"
+            echo "| Build | ${{ steps.build.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Merge-only: local e2e ───────────────────────────────────────────────────
+  # Builds each app and runs its Playwright suite against a locally-served
+  # instance (turbo's `test:e2e` task already wires build -> serve -> test).
+  # This is NOT re-running the PR gate — it is the one check that only makes
+  # sense once code has actually merged, because it exercises full page loads
+  # end-to-end rather than unit-level assertions.
+  e2e:
+    name: End-to-end (local build)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # scanner-app is deliberately excluded — Playwright drives a browser
+      # against a served Next.js app; it has no target here (native app,
+      # no Playwright equivalent in this repo yet). Don't add it to this
+      # matrix; a native E2E effort gets its own job under its own tool.
+      matrix:
+        app: [guest-portal, partner-dashboard, admin-console]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+
+      - name: Seed placeholder env for build
+        run: |
+          if [ -f "apps/${{ matrix.app }}/.env.example" ]; then
+            cp "apps/${{ matrix.app }}/.env.example" "apps/${{ matrix.app }}/.env.local"
+          fi
+
+      - name: Install Playwright browsers
+        working-directory: apps/${{ matrix.app }}
+        run: pnpm exec playwright install --with-deps chromium webkit
+
+      # Onboarding intercepts Identity Toolkit requests in Playwright. The
+      # browser SDK still requires public config at build time; these values
+      # identify no real Firebase project and must never be deployment config.
+      - name: Configure mocked Partner phone verification
+        if: matrix.app == 'partner-dashboard'
+        run: |
+          cat >> apps/partner-dashboard/.env.local <<'EOF'
+          NEXT_PUBLIC_FIREBASE_API_KEY=e2e-not-a-real-api-key
+          NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=e2e.invalid
+          NEXT_PUBLIC_FIREBASE_PROJECT_ID=e2e
+          EOF
+
+      - name: Run e2e suite
+        env:
+          CI: "true"
+        run: pnpm turbo run test:e2e --filter=./apps/${{ matrix.app }}
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-report-${{ matrix.app }}
+          path: apps/${{ matrix.app }}/playwright-report/
+          retention-days: 14
+
+  # ── Merge-only: post-deploy smoke ───────────────────────────────────────────
+  # Vercel's own Git integration deploys on push, out of band from this
+  # workflow (same relationship the backend has with Render). This waits a
+  # short grace period for that deploy to land, then hits each app's real
+  # public URL and asserts it actually serves a page — catches the class of
+  # bug a local `pnpm build` cannot: a broken env var or alias on the
+  # platform itself.
+  post-deploy-smoke:
+    name: Post-deploy smoke (live URLs)
+    needs: e2e
+    if: github.event_name == 'push' && github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wait for Vercel to deploy
+        run: sleep 90
+
+      - name: Smoke-check live apps
+        run: |
+          set -euo pipefail
+          fail=0
+          for url in \
+            https://c1rcle-v2-guest-portal.vercel.app \
+            https://c1rcle-v2-admin-console.vercel.app \
+            https://c1-rcle-frontend-partner-dashboard.vercel.app \
+            ; do
+            status=$(curl -s -o /dev/null -w '%{http_code}' "$url")
+            if [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then
+              echo "  OK  $url -> $status"
+            else
+              echo "::error::$url returned $status"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  # ── Cross-repo contract parity ──────────────────────────────────────────────
+  # The wire contract has two copies: this repo's `@c1rcle/contracts`,
+  # `@c1rcle/types` and `@c1rcle/api-client`, and the backend's
+  # `packages/contracts`. `scripts/contract-parity.mjs` (in the backend repo)
+  # parses shared fixtures with both and fails on accept/reject disagreement.
+  # The backend CI runs it for backend PRs; this job covers the other direction
+  # so a frontend-only schema change cannot drift silently.
+  #
+  # A frontend PR may declare one private paired backend PR in its body using
+  # `<!-- backend-contract-pair: owner/repository#123 -->`. While open, parity
+  # uses that exact backend head; after merge, it uses the frontend target
+  # branch. Unpaired PRs keep the target-branch fallback. The backend repo is
+  # private: BACKEND_REPO_TOKEN must read both its contents and PR metadata.
+  # Without access, this job fails loudly rather than skipping.
+  changes:
+    name: Detect contract changes
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      contracts: ${{ steps.filter.outputs.contracts }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - id: filter
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        with:
+          filters: |
+            contracts:
+              - 'packages/contracts/**'
+              - 'packages/types/**'
+              - 'packages/api-client/**'
+              - '.github/workflows/ci.yml'
+
+  contract-parity:
+    name: Contract parity (backend)
+    needs: changes
+    if: always() && (github.event_name == 'workflow_dispatch' || needs.changes.outputs.contracts == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          path: frontend
+          persist-credentials: false
+      - name: Resolve paired backend contract ref
+        id: backend-ref
+        working-directory: frontend
+        env:
+          BACKEND_REPO: ${{ vars.BACKEND_REPO || 'thec1rclehost123-cmd/C1RCLE-BACKEND' }}
+          BACKEND_REF_INPUT: ${{ inputs.backend_ref || vars.BACKEND_REF || '' }}
+          BACKEND_REPO_TOKEN: ${{ secrets.BACKEND_REPO_TOKEN || github.token }}
+        run: |
+          node scripts/resolve-backend-ref.test.mjs
+          node scripts/resolve-backend-ref.mjs
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ vars.BACKEND_REPO || 'thec1rclehost123-cmd/C1RCLE-BACKEND' }}
+          ref: ${{ steps.backend-ref.outputs.backend_ref }}
+          token: ${{ secrets.BACKEND_REPO_TOKEN || github.token }}
+          path: backend
+          persist-credentials: false
+
+      # The repos pin different pnpm majors (frontend 10, backend 11) and Node
+      # versions, so corepack picks each repo's own `packageManager` instead of
+      # one global pnpm. The parity script needs Node >= 22.15
+      # (`module.registerHooks`); Node 24 satisfies it.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Build backend contracts
+        working-directory: backend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @c1rcle/contracts build
+
+      - name: Build frontend contracts
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @c1rcle/contracts build
+          pnpm --filter @c1rcle/api-client build
+
+      # Exit 0 = agree, 1 = drift, 2 = cannot check (missing dists).
+      - name: Record exact contract pair
+        run: |
+          echo "Frontend SHA: $(git -C frontend rev-parse HEAD)"
+          echo "Backend SHA:  $(git -C backend rev-parse HEAD)"
+          echo "Backend ref source: ${{ steps.backend-ref.outputs.source }}"
+
+      - name: Compare contracts
+        working-directory: backend
+        run: node scripts/contract-parity.mjs --frontend "$GITHUB_WORKSPACE/frontend"
+
+  # ── The single required status check for PRs ───────────────────────────────
+  ci-ok:
+    name: CI OK
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
+    needs: [gate, contract-parity]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Assert the gate passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key)\t\(.value.result)"'
+          bad=$(echo "$NEEDS" | jq -r 'to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | .key')
+          if [ -n "$bad" ]; then
+            echo "::error::These gates did not pass: $(echo "$bad" | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "All gates green."

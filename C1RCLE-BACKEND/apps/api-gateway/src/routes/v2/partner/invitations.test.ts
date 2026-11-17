@@ -1,0 +1,238 @@
+import { createOrganization } from '@c1rcle/core/domain';
+import { type MemoryUserAccountRepository } from '@c1rcle/core/infrastructure';
+import { describe, expect, it } from 'vitest';
+
+import { createV2Services } from '../../../lib/v2-services.js';
+import { buildPartnerTestServer } from '../../../test-utils/partner-test-server.js';
+
+import partnerOrganizationRoutes from './organizations.js';
+
+/**
+ * ─── Invitations over HTTP ───────────────────────────────────────────────────
+ * Phase 0 could not register this route: with no pending-invitation concept in
+ * the domain, the only possible response was a hardcoded empty list, which
+ * rule 10 forbids. Now it reports real state.
+ */
+
+let keySeq = 0;
+const read = (organizationId: string) => ({ 'x-organization-id': organizationId });
+const write = (organizationId: string) => ({
+  ...read(organizationId),
+  'idempotency-key': `inv-key-${++keySeq}`,
+});
+
+const buildServer = () => buildPartnerTestServer({ routes: [partnerOrganizationRoutes] });
+
+/** Seed an already approved workspace; direct applicant provisioning is forbidden. */
+async function seedOrganization(_server: Awaited<ReturnType<typeof buildServer>>): Promise<string> {
+  const org = createOrganization({
+    id: `inv-org-${++keySeq}`,
+    name: 'Skyline',
+    slug: `skyline-${keySeq}`,
+    ownerId: 'user_1',
+  });
+  await createV2Services().repos().organizations.save(org);
+  return org.id;
+}
+
+describe('organization invitations', () => {
+  it('lists nothing before any invitation exists — real state, not a stub', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/invitations`,
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ items: [], pageInfo: { total: 0 } });
+    await server.close();
+  });
+
+  it('creates a pending invitation and then lists it', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const created = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/invitations`,
+      headers: write(org),
+      payload: { email: 'New@Example.com', role: 'manager' },
+    });
+
+    expect(created.statusCode).toBe(201);
+    expect(created.json()).toMatchObject({
+      // Normalized on the way in, so casing cannot fork the identity.
+      email: 'new@example.com',
+      role: 'manager',
+      status: 'pending',
+    });
+
+    const listed = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/invitations`,
+      headers: read(org),
+    });
+    expect(listed.json().items).toHaveLength(1);
+    await server.close();
+  });
+
+  it('refuses a second pending invitation for the same address', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const payload = { email: 'dupe@example.com', role: 'member' };
+    await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/invitations`,
+      headers: write(org),
+      payload,
+    });
+    const second = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/invitations`,
+      headers: write(org),
+      payload,
+    });
+
+    // Two live invitations would let one person join twice with whichever role
+    // they happened to click.
+    expect(second.statusCode).toBe(400);
+    await server.close();
+  });
+
+  it('rejects an owner invitation at the schema boundary', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/invitations`,
+      headers: write(org),
+      payload: { email: 'owner@example.com', role: 'owner' },
+    });
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json().fieldErrors).toHaveProperty('role');
+    await server.close();
+  });
+
+  it('revokes a pending invitation', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const created = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/invitations`,
+      headers: write(org),
+      payload: { email: 'revoke@example.com', role: 'member' },
+    });
+    const invitationId = created.json().id;
+
+    const revoked = await server.inject({
+      method: 'POST',
+      url: `/invitations/${invitationId}/revoke`,
+      headers: write(org),
+    });
+
+    expect(revoked.statusCode).toBe(200);
+    expect(revoked.json()).toMatchObject({ status: 'revoked' });
+    await server.close();
+  });
+
+  it('closes the invitation without duplicating when the accepter is already a member', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const created = await server.inject({
+      method: 'POST',
+      url: `/organizations/${org}/invitations`,
+      headers: write(org),
+      payload: { email: 'joiner@example.com', role: 'member' },
+    });
+    const invitationId = created.json().id;
+
+    // The already-member path still requires the actor's persisted, verified
+    // email to match the invitation recipient. Owning the org is not a bypass.
+    (createV2Services().repos().users as MemoryUserAccountRepository).save({
+      id: 'user_1',
+      email: 'joiner@example.com',
+      emailVerified: true,
+      name: 'Synthetic existing member',
+      image: null,
+      role: 'partner',
+      createdAt: 0,
+      updatedAt: 0,
+    });
+    const membershipBefore = (await createV2Services().repos().organizations.getById(org))?.members;
+    const accepted = await server.inject({
+      method: 'POST',
+      url: `/invitations/${invitationId}/accept`,
+    });
+
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json()).toMatchObject({ id: org });
+    expect((await createV2Services().repos().organizations.getById(org))?.members).toEqual(
+      membershipBefore,
+    );
+
+    const listed = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/invitations`,
+      headers: read(org),
+    });
+    expect(listed.json().items).toMatchObject([{ id: invitationId, status: 'accepted' }]);
+    await server.close();
+  });
+
+  it('reports an unknown invitation as not-found without leaking existence', async () => {
+    const server = await buildServer();
+    await seedOrganization(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/invitations/does_not_exist/accept',
+    });
+
+    expect(response.statusCode).toBe(404);
+    await server.close();
+  });
+});
+
+describe('partner access context', () => {
+  it('computes permissions and tab visibility server-side', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/organizations/${org}/access`,
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    // The creator is the owner, and a venue-capable owner has no tab
+    // restriction — `null` means "show everything", not "show nothing".
+    expect(body).toMatchObject({ organizationId: org, role: 'OWNER', tabVisibility: null });
+    expect(body.permissions).toContain('VIEW_FINANCIALS');
+    expect(body.permissions).toContain('MANAGE_STAFF');
+    await server.close();
+  });
+
+  it('refuses to describe an organization the caller is not in', async () => {
+    const server = await buildServer();
+    const org = await seedOrganization(server);
+
+    const response = await server.inject({
+      method: 'GET',
+      url: '/organizations/not_mine/access',
+      headers: read(org),
+    });
+
+    expect(response.statusCode).toBe(403);
+    await server.close();
+  });
+});

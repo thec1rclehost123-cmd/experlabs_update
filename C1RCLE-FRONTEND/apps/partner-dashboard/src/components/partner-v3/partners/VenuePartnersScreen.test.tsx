@@ -1,0 +1,67 @@
+import { fireEvent, render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+
+import { fixturePartnerDataSource } from '@/data/fixture-partner-data-source';
+
+import { VenuePartnersScreen } from './VenuePartnersScreen';
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ refresh: vi.fn() }),
+}));
+
+describe('VenuePartnersScreen', () => {
+  it('renders connected hosts and URL-backed navigation', async () => {
+    const data = await fixturePartnerDataSource.getVenuePartners();
+    render(<VenuePartnersScreen data={data} />);
+
+    expect(screen.getByRole('heading', { name: 'Partners' })).toBeInTheDocument();
+    expect(screen.getByText('Kabir M. (Sunday Sessions)')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Promoters' })).toHaveAttribute(
+      'href',
+      '/partner/venue/partners?tab=promoters',
+    );
+    expect(screen.getByRole('link', { name: 'Discover' })).toHaveAttribute(
+      'href',
+      '/partner/venue/partners?view=discover',
+    );
+    expect(screen.getAllByRole('link', { name: /View profile/ })[0]).toHaveAttribute(
+      'href',
+      '/partner/venue/partners?profile=kabir-sunday-sessions',
+    );
+  });
+
+  it('does not link an empty Discover view back to itself', async () => {
+    const data = await fixturePartnerDataSource.getVenuePartners();
+    render(
+      <VenuePartnersScreen
+        data={{ ...data, hosts: { ...data.hosts, discover: [] } }}
+        subView="discover"
+      />,
+    );
+
+    expect(
+      screen.getByText('No partners are available to discover right now.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Browse discover' })).not.toBeInTheDocument();
+  });
+
+  it('renders requests, staff access, and fixture-safe staff invitation entry', async () => {
+    const data = await fixturePartnerDataSource.getVenuePartners();
+    const { rerender } = render(
+      <VenuePartnersScreen data={data} segment="promoters" subView="requests" />,
+    );
+
+    expect(screen.getByText('Rhea (Afterglow)')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Accept' })).toBeDisabled();
+
+    rerender(<VenuePartnersScreen data={data} segment="staff" />);
+    expect(screen.getByText('Maya S.')).toBeInTheDocument();
+    expect(screen.queryByText('Door check-in')).not.toBeInTheDocument();
+    const manage = screen.getAllByRole('button', { name: 'Manage access' })[0];
+    if (!manage) throw new Error('Missing access action');
+    fireEvent.click(manage);
+    expect(screen.getByText('Current access')).toBeInTheDocument();
+    expect(screen.getByText('Door check-in')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Add staff' })).toBeInTheDocument();
+  });
+});

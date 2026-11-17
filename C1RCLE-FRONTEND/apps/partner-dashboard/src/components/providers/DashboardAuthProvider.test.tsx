@@ -1,0 +1,332 @@
+import { render, screen, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { DashboardAuthProvider, useDashboardAuth } from './DashboardAuthProvider';
+
+import type { OnboardingRequestDto, OrganizationDto, PartnerAccessDto } from '@c1rcle/contracts';
+
+interface FakeSession {
+  isAuthenticated: boolean;
+  isLoading: boolean;
+  isHydrated: boolean;
+  user: { id: string; email: string; displayName: string; emailVerified?: boolean } | null;
+}
+
+const mockUseSession = vi.fn<() => FakeSession>();
+const mockUsePathname = vi.fn<() => string>();
+
+vi.mock('next/navigation', () => ({
+  usePathname: () => mockUsePathname(),
+}));
+
+vi.mock('@c1rcle/auth', () => ({
+  useSession: () => mockUseSession(),
+  login: vi.fn(),
+  logout: vi.fn(),
+  signup: vi.fn(),
+  getAccessToken: () => 'tok_abc',
+}));
+
+const mockGetOrganizations = vi.fn<() => Promise<OrganizationDto[]>>();
+const mockGetPartnerAccess = vi.fn<(organizationId: string) => Promise<PartnerAccessDto>>();
+vi.mock('@/lib/org/org-repository', () => ({
+  getOrganizations: () => mockGetOrganizations(),
+  getPartnerAccess: (organizationId: string) => mockGetPartnerAccess(organizationId),
+}));
+
+const mockGetMyOnboardingRequest = vi.fn<() => Promise<OnboardingRequestDto | null>>();
+vi.mock('@/lib/onboarding/onboarding-repository', () => ({
+  getMyOnboardingRequest: () => mockGetMyOnboardingRequest(),
+}));
+
+const mockGetActiveOrgId = vi.fn<() => string | null>();
+const mockSetActiveOrg = vi.fn<(orgId: string | null) => Promise<void>>();
+vi.mock('@/lib/org/active-org', () => ({
+  getActiveOrgId: () => mockGetActiveOrgId(),
+  setActiveOrg: (orgId: string | null) => mockSetActiveOrg(orgId),
+}));
+
+interface FakeOrgAccess {
+  partnerType: string | null;
+  role: string | null;
+  permissions: string[];
+  tabVisibility: Record<string, boolean> | null;
+  isLoading: boolean;
+  error: Error | null;
+  isSuspended: boolean;
+  hasPermission: (permission: string) => boolean;
+  tabVisible: (tab: string) => boolean;
+}
+
+const mockUseOrgAccess = vi.fn<(orgId: string | null) => FakeOrgAccess>();
+vi.mock('@/lib/access/use-org-access', () => ({
+  useOrgAccess: (orgId: string | null) => mockUseOrgAccess(orgId),
+}));
+
+function Probe() {
+  const auth = useDashboardAuth();
+  return (
+    <div>
+      <span data-testid="loading">{String(auth.loading)}</span>
+      <span data-testid="approved">{String(auth.isApproved)}</span>
+      <span data-testid="banned">{String(auth.isBanned)}</span>
+      <span data-testid="candoAny">{String(auth.canDo('anything'))}</span>
+      <span data-testid="memberships">{auth.memberships.length}</span>
+    </div>
+  );
+}
+
+const AUTH_ORG_ACCESS_IDLE = {
+  partnerType: null,
+  role: null,
+  permissions: [],
+  tabVisibility: null,
+  isLoading: false,
+  error: null,
+  isSuspended: false,
+  hasPermission: () => false,
+  tabVisible: () => true,
+};
+
+beforeEach(() => {
+  mockUseSession.mockReset();
+  mockUsePathname.mockReset().mockReturnValue('/venue/overview');
+  mockGetOrganizations.mockReset();
+  mockGetPartnerAccess.mockReset();
+  mockGetMyOnboardingRequest.mockReset();
+  mockGetActiveOrgId.mockReset().mockReturnValue(null);
+  mockSetActiveOrg.mockReset().mockResolvedValue(undefined);
+  mockUseOrgAccess.mockReset().mockReturnValue(AUTH_ORG_ACCESS_IDLE);
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe('DashboardAuthProvider', () => {
+  it('shows the loading splash while the session is unknown', () => {
+    mockUseSession.mockReturnValue({
+      isAuthenticated: false,
+      isLoading: true,
+      isHydrated: true,
+      user: null,
+    });
+
+    render(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(screen.queryByTestId('loading')).not.toBeInTheDocument();
+  });
+
+  it('lets server-authorized event pages render while client authorization hydrates', () => {
+    mockUsePathname.mockReturnValue('/partner/venue/events/event_m3/analytics');
+    mockUseSession.mockReturnValue({
+      isAuthenticated: false,
+      isLoading: true,
+      isHydrated: true,
+      user: null,
+    });
+
+    render(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    expect(screen.getByTestId('loading')).toHaveTextContent('true');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('renders children with real defaults once anonymous', async () => {
+    mockUseSession.mockReturnValue({
+      isAuthenticated: false,
+      isLoading: false,
+      isHydrated: true,
+      user: null,
+    });
+
+    render(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('loading')).toHaveTextContent('false'));
+    expect(screen.getByTestId('approved')).toHaveTextContent('false');
+    // No isBanned backend concept exists in V2 yet — always false, documented in the provider.
+    expect(screen.getByTestId('banned')).toHaveTextContent('false');
+    expect(screen.getByTestId('candoAny')).toHaveTextContent('false');
+    expect(screen.getByTestId('memberships')).toHaveTextContent('0');
+  });
+
+  it('fetches organizations and onboarding status once authenticated, and auto-selects a lone org', async () => {
+    mockUseSession.mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isHydrated: true,
+      user: { id: 'usr_1', email: 'a@b.com', displayName: 'A', emailVerified: true },
+    });
+    mockGetOrganizations.mockResolvedValue([
+      {
+        id: 'org_1',
+        name: 'Only Org',
+        slug: 'only-org',
+        role: 'owner',
+        status: 'active',
+        version: 1,
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    ]);
+    mockGetPartnerAccess.mockResolvedValue({
+      organizationId: 'org_1',
+      userId: 'usr_1',
+      partnerType: 'venue',
+      role: 'owner',
+      permissions: ['VIEW_ANALYTICS'],
+      tabVisibility: null,
+    });
+    mockGetMyOnboardingRequest.mockResolvedValue({
+      id: 'req_1',
+      userId: 'usr_1',
+      status: 'approved',
+      requestedType: 'venue',
+      plan: 'basic',
+      profile: {
+        legalName: 'Only Org',
+        contactPerson: 'A',
+        phone: '+919876543210',
+        city: 'Mumbai',
+      },
+      documents: [],
+      promoterAgreementAcceptances: [],
+      missingDocuments: [],
+      submittedAt: '2026-01-01T00:00:00.000Z',
+      reviewedBy: null,
+      reviewedAt: null,
+      reviewNote: null,
+      provisionedOrganizationId: 'org_1',
+      version: 1,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    render(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('loading')).toHaveTextContent('false'));
+    expect(screen.getByTestId('memberships')).toHaveTextContent('1');
+    expect(screen.getByTestId('approved')).toHaveTextContent('true');
+    expect(mockSetActiveOrg).toHaveBeenCalledWith('org_1');
+  });
+
+  it('does not read onboarding data until the server reports a verified email', async () => {
+    mockUseSession.mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isHydrated: true,
+      user: { id: 'usr_pending', email: 'pending@example.invalid', displayName: 'Pending' },
+    });
+    mockGetOrganizations.mockResolvedValue([]);
+
+    render(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId('loading')).toHaveTextContent('false'));
+    expect(mockGetOrganizations).toHaveBeenCalledOnce();
+    expect(mockGetMyOnboardingRequest).not.toHaveBeenCalled();
+  });
+
+  it('waits for token hydration before starting protected account reads', async () => {
+    mockUseSession.mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isHydrated: false,
+      user: { id: 'usr_1', email: 'a@b.com', displayName: 'A', emailVerified: true },
+    });
+    mockGetOrganizations.mockResolvedValue([]);
+    mockGetMyOnboardingRequest.mockResolvedValue(null);
+
+    const { rerender } = render(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    expect(screen.getByRole('status')).toBeInTheDocument();
+    expect(mockGetOrganizations).not.toHaveBeenCalled();
+    expect(mockGetMyOnboardingRequest).not.toHaveBeenCalled();
+
+    mockUseSession.mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isHydrated: true,
+      user: { id: 'usr_1', email: 'a@b.com', displayName: 'A', emailVerified: true },
+    });
+    rerender(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    await waitFor(() => {
+      expect(mockGetOrganizations).toHaveBeenCalledOnce();
+    });
+    expect(mockGetMyOnboardingRequest).toHaveBeenCalledOnce();
+  });
+
+  it('does not block an authorized active workspace on background account hydration', async () => {
+    mockGetActiveOrgId.mockReturnValue('org_1');
+    mockUseSession.mockReturnValue({
+      isAuthenticated: true,
+      isLoading: false,
+      isHydrated: true,
+      user: { id: 'usr_1', email: 'a@b.com', displayName: 'A' },
+    });
+    mockUseOrgAccess.mockReturnValue({
+      ...AUTH_ORG_ACCESS_IDLE,
+      partnerType: 'venue',
+      role: 'owner',
+      permissions: ['VIEW_ANALYTICS'],
+    });
+
+    let finishOrganizations!: (value: OrganizationDto[]) => void;
+    let finishOnboarding!: (value: OnboardingRequestDto | null) => void;
+    mockGetOrganizations.mockReturnValue(
+      new Promise((resolve) => {
+        finishOrganizations = resolve;
+      }),
+    );
+    mockGetMyOnboardingRequest.mockReturnValue(
+      new Promise((resolve) => {
+        finishOnboarding = resolve;
+      }),
+    );
+
+    render(
+      <DashboardAuthProvider>
+        <Probe />
+      </DashboardAuthProvider>,
+    );
+
+    expect(screen.getByTestId('loading')).toHaveTextContent('false');
+    expect(screen.getByTestId('approved')).toHaveTextContent('true');
+    expect(screen.getByTestId('memberships')).toHaveTextContent('0');
+
+    finishOrganizations([]);
+    finishOnboarding(null);
+    await waitFor(() => {
+      expect(mockGetOrganizations).toHaveBeenCalledOnce();
+    });
+  });
+});

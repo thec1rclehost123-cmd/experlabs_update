@@ -1,0 +1,290 @@
+import { describe, expect, it } from 'vitest';
+
+import { buildApp } from './app.js';
+import { getGatewayConfig } from './config/index.js';
+import { createGatewayRuntimeState } from './lib/runtime-state.js';
+
+function testConfig(overrides: Record<string, string> = {}) {
+  return getGatewayConfig({
+    NODE_ENV: 'test',
+    STORAGE_DRIVER: 'memory',
+    TRUSTED_PROXY_CIDRS: '127.0.0.1',
+    ALLOWED_ORIGINS: 'http://localhost:3000,https://staging.example.test',
+    BETTER_AUTH_TRUSTED_ORIGINS: 'http://localhost:3000,https://staging.example.test',
+    ...overrides,
+  });
+}
+
+describe('app bootstrap + internal routes', () => {
+  it('bounds request bodies and redacts unexpected server errors', async () => {
+    const app = await buildApp({ config: testConfig({ LOG_LEVEL: 'silent' }) });
+    let reached = false;
+    app.post('/security-body-probe', () => {
+      reached = true;
+      return {};
+    });
+    app.get('/security-error-probe', () => {
+      throw new Error('synthetic-private-error-material');
+    });
+    const oversized = await app.inject({
+      method: 'POST',
+      url: '/security-body-probe',
+      payload: { value: 'x'.repeat(1024 * 1024) },
+    });
+    expect(oversized.statusCode).toBe(413);
+    expect(oversized.json()).toMatchObject({ status: 413, requestId: expect.any(String) });
+    expect(reached).toBe(false);
+    const error = await app.inject('/security-error-probe');
+    expect(error.statusCode).toBe(500);
+    expect(error.json()).toMatchObject({
+      status: 500,
+      code: 'server',
+      message: 'Internal server error',
+    });
+    expect(error.body).not.toContain('synthetic-private-error-material');
+    await app.close();
+  });
+
+  it('rejects untrusted browser writes before reaching handlers, while allowing BFF calls', async () => {
+    const app = await buildApp();
+    let calls = 0;
+    app.post('/security-write-probe', () => {
+      calls += 1;
+      return { ok: true };
+    });
+    for (const headers of [
+      { origin: 'https://evil.example' },
+      { origin: 'null' },
+      { 'sec-fetch-site': 'cross-site' },
+    ]) {
+      const res = await app.inject({ method: 'POST', url: '/security-write-probe', headers });
+      expect(res.statusCode).toBe(403);
+    }
+    expect(calls).toBe(0);
+    expect((await app.inject({ method: 'POST', url: '/security-write-probe' })).statusCode).toBe(
+      200,
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/security-write-probe',
+          headers: { origin: 'http://localhost:3001', 'sec-fetch-site': 'cross-site' },
+        })
+      ).statusCode,
+    ).toBe(200);
+    await app.close();
+  });
+
+  it('serves /api/v2/internal/health', async () => {
+    const app = await buildApp({});
+    const res = await app.inject({ method: 'GET', url: '/api/v2/internal/health' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().ok).toBe(true);
+    await app.close();
+  });
+
+  it('does not accept a direct client x-request-id as the authoritative ID', async () => {
+    const app = await buildApp({ config: testConfig({ TRUSTED_PROXY_CIDRS: '198.51.100.0/24' }) });
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v2/internal/health',
+      headers: { 'x-request-id': 'req-123' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers['x-request-id']).not.toBe('req-123');
+    expect(res.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+    await app.close();
+  });
+
+  it('accepts forwarding headers and the request ID from a trusted proxy peer', async () => {
+    const app = await buildApp({ config: testConfig() });
+    app.get('/__test/proxy-context', async (request) => ({
+      ip: request.ip,
+      protocol: request.protocol,
+      host: request.host,
+      hostname: request.hostname,
+    }));
+
+    try {
+      const address = await app.listen({ port: 0, host: '127.0.0.1' });
+      const response = await fetch(`${address}/__test/proxy-context`, {
+        headers: {
+          Host: 'edge.example.test',
+          'X-Forwarded-For': '203.0.113.10',
+          'X-Forwarded-Proto': 'https',
+          'X-Forwarded-Host': 'api.example.test',
+          'X-Request-Id': 'edge-request-123',
+        },
+      });
+      const body = (await response.json()) as Record<string, string>;
+      expect(response.status).toBe(200);
+      expect(body.ip).toBe('203.0.113.10');
+      expect(body.protocol).toBe('https');
+      expect(body.hostname).toBe('api.example.test');
+      expect(response.headers.get('x-request-id')).toBe('edge-request-123');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('ignores forwarding headers from an untrusted peer', async () => {
+    const app = await buildApp({ config: testConfig({ TRUSTED_PROXY_CIDRS: '198.51.100.0/24' }) });
+    app.get('/__test/proxy-context', async (request) => ({
+      ip: request.ip,
+      protocol: request.protocol,
+      hostname: request.hostname,
+    }));
+
+    try {
+      const address = await app.listen({ port: 0, host: '127.0.0.1' });
+      const response = await fetch(`${address}/__test/proxy-context`, {
+        headers: {
+          'X-Forwarded-For': '203.0.113.10',
+          'X-Forwarded-Proto': 'https',
+          'X-Forwarded-Host': 'api.example.test',
+          'X-Request-Id': 'client-request-123',
+        },
+      });
+      const body = (await response.json()) as Record<string, string>;
+      expect(response.status).toBe(200);
+      expect(body.ip).toBe('127.0.0.1');
+      expect(body.protocol).toBe('http');
+      expect(body.hostname).not.toBe('api.example.test');
+      expect(response.headers.get('x-request-id')).not.toBe('client-request-123');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('allows configured origins and handles credentialed preflight', async () => {
+    const app = await buildApp({ config: testConfig() });
+    const allowed = await app.inject({
+      method: 'GET',
+      url: '/api/v2/internal/health',
+      headers: { origin: 'https://staging.example.test' },
+    });
+    expect(allowed.headers['access-control-allow-origin']).toBe('https://staging.example.test');
+    expect(allowed.headers['access-control-allow-credentials']).toBe('true');
+
+    const denied = await app.inject({
+      method: 'GET',
+      url: '/api/v2/internal/health',
+      headers: { origin: 'https://untrusted.example.test' },
+    });
+    expect(denied.headers['access-control-allow-origin']).toBeUndefined();
+
+    const preflight = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/v2/organizations',
+      headers: {
+        origin: 'https://staging.example.test',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'Authorization, X-Organization-Id, Idempotency-Key',
+      },
+    });
+    expect(preflight.statusCode).toBe(204);
+    expect(preflight.headers['access-control-allow-methods']).toContain('POST');
+    expect(preflight.headers['access-control-allow-headers']).toContain('Authorization');
+    await app.close();
+  });
+
+  it.each([
+    ['a trailing slash', 'https://c1rcle-v2-admin-console.vercel.app/'],
+    ['the default https port', 'https://c1rcle-v2-admin-console.vercel.app:443'],
+    ['an upper-case host', 'https://C1RCLE-v2-Admin-Console.vercel.app'],
+  ])('matches the browser Origin when ALLOWED_ORIGINS has %s', async (_label, configured) => {
+    // Regression: these forms passed config validation but were handed to
+    // @fastify/cors verbatim, so the exact-string compare against the browser's
+    // canonical Origin never matched and the admin console's authenticated
+    // preflight came back without Access-Control-Allow-Origin.
+    const origin = 'https://c1rcle-v2-admin-console.vercel.app';
+    const app = await buildApp({
+      config: testConfig({ ALLOWED_ORIGINS: configured, BETTER_AUTH_TRUSTED_ORIGINS: configured }),
+    });
+    const preflight = await app.inject({
+      method: 'OPTIONS',
+      url: '/api/v2/admin/onboarding/applications?status=submitted&limit=100',
+      headers: {
+        origin,
+        'access-control-request-method': 'GET',
+        'access-control-request-headers': 'authorization,x-request-id',
+      },
+    });
+    expect(preflight.statusCode).toBe(204);
+    expect(preflight.headers['access-control-allow-origin']).toBe(origin);
+    expect(preflight.headers['access-control-allow-credentials']).toBe('true');
+    await app.close();
+  });
+
+  it('404s blocked/unknown v2 routes with the canonical envelope (never 501)', async () => {
+    const app = await buildApp({});
+    // Out-of-scope slice path (payments) must 404 by absence.
+    const res = await app.inject({ method: 'POST', url: '/api/v2/organizations/org_1/payments' });
+    expect(res.statusCode).toBe(404);
+    const body = res.json();
+    // Flat envelope — matches every route-level error send. A wrapped
+    // `{ error: {...} }` shape here would encode the bug this session (and
+    // independently, Sagar's parallel B10 work) found and fixed.
+    expect(body.code).toBe('not_found');
+    expect(body.requestId).toBeDefined();
+    await app.close();
+  });
+
+  it('GET /api/v2/internal/version returns semantic version', async () => {
+    const app = await buildApp({
+      config: testConfig({ APP_VERSION: '0.1.0-test', BUILD_SHA: 'abc123' }),
+    });
+    const res = await app.inject({ method: 'GET', url: '/api/v2/internal/version' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ version: '0.1.0-test', buildSha: 'abc123' });
+    expect(typeof res.json().startedAt).toBe('string');
+    await app.close();
+  });
+
+  it('returns 503 when a required readiness check fails', async () => {
+    const app = await buildApp({
+      config: testConfig(),
+      readinessChecks: { firestore: () => false },
+    });
+    const res = await app.inject({ method: 'GET', url: '/api/v2/internal/readiness' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({
+      ok: false,
+      checks: { configuration: 'up', gateway: 'up', firestore: 'down' },
+    });
+    await app.close();
+  });
+
+  it('returns 503 when the gateway is shutting down', async () => {
+    const runtimeState = createGatewayRuntimeState();
+    const app = await buildApp({ config: testConfig(), runtimeState });
+    runtimeState.markShuttingDown();
+
+    const res = await app.inject({ method: 'GET', url: '/api/v2/internal/readiness' });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({
+      ok: false,
+      checks: { configuration: 'up', gateway: 'down' },
+    });
+    await app.close();
+  });
+
+  it('CORS preflight allows PATCH/PUT/DELETE from a trusted frontend origin', async () => {
+    // @fastify/cors defaults `methods` to 'GET,HEAD,POST' — narrower than the v2 API
+    // actually uses (e.g. the onboarding autosave PATCH). Regression for that gap.
+    const app = await buildApp({});
+    for (const method of ['PATCH', 'PUT', 'DELETE']) {
+      const res = await app.inject({
+        method: 'OPTIONS',
+        url: '/api/v2/onboarding/applications/req_1',
+        headers: {
+          origin: 'http://localhost:3001',
+          'access-control-request-method': method,
+        },
+      });
+      expect(res.headers['access-control-allow-methods']).toContain(method);
+    }
+    await app.close();
+  });
+});

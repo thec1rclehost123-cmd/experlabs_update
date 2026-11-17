@@ -1,0 +1,402 @@
+import { checkoutQuoteResponseSchema } from '@c1rcle/contracts';
+import { describe, expect, it } from 'vitest';
+
+import { seedApprovedPartnerOrganization } from '../../../test-utils/approved-partner-organization.js';
+import {
+  buildPartnerTestServer,
+  futureTestEventStartAt,
+} from '../../../test-utils/partner-test-server.js';
+import { publishEventForTest } from '../../../test-utils/publish-event.js';
+import { seedVerifiedCheckoutUsers } from '../../../test-utils/verified-test-users.js';
+import partnerEventCatalogRoutes from '../partner/event-catalog.js';
+import partnerEventRoutes from '../partner/events.js';
+import partnerOrganizationRoutes from '../partner/organizations.js';
+import partnerVenueRoutes from '../partner/venues.js';
+
+import checkoutRoutes from './checkout-routes.js';
+
+/**
+ * ─── Guest checkout over HTTP (Phase 4 PR2) ─────────────────────────────────
+ * `POST /checkout/quote` (pure calculation) and `POST /checkout/holds`
+ * (reserves inventory). Asserts the transport contract plus the two
+ * correctness properties the sprint's exit gate names explicitly: pricing
+ * reconciles, and two guests cannot both hold the last ticket.
+ */
+
+let keySeq = 0;
+const buildServer = () => {
+  seedVerifiedCheckoutUsers();
+  return buildPartnerTestServer({
+    routes: [
+      partnerOrganizationRoutes,
+      partnerVenueRoutes,
+      partnerEventRoutes,
+      partnerEventCatalogRoutes,
+      checkoutRoutes,
+    ],
+  });
+};
+
+type Server = Awaited<ReturnType<typeof buildServer>>;
+
+const write = (org: string) => ({
+  'x-organization-id': org,
+  'idempotency-key': `catalog-key-${++keySeq}`,
+});
+
+/** Creates org → venue → event → one ticket tier; returns everything checkout needs. */
+async function seed(
+  server: Server,
+  options: { priceInPaise?: number; quantity?: number; maxPerUser?: number } = {},
+): Promise<{ org: string; eventId: string; tierId: string; priceInPaise: number }> {
+  ++keySeq;
+  const created = await seedApprovedPartnerOrganization({
+    name: 'Skyline',
+    slug: `skyline-${keySeq}`,
+  });
+  const org: string = created.id;
+
+  const venue = await server.inject({
+    method: 'POST',
+    url: `/organizations/${org}/venues`,
+    headers: write(org),
+    payload: { name: 'Sky Bar', slug: `sky-bar-${keySeq}` },
+  });
+  const venueId: string = venue.json().id;
+
+  const event = await server.inject({
+    method: 'POST',
+    url: `/organizations/${org}/events`,
+    headers: write(org),
+    payload: { title: 'Sky Night', venueId, startAt: futureTestEventStartAt() },
+  });
+  const eventId: string = event.json().id;
+  await publishEventForTest(eventId);
+
+  const priceInPaise = options.priceInPaise ?? 150_000;
+  const quantity = options.quantity ?? 100;
+  const tier = await server.inject({
+    method: 'POST',
+    url: `/events/${eventId}/ticket-tiers`,
+    headers: write(org),
+    payload: {
+      name: 'General',
+      priceInPaise,
+      quantity,
+      ...(options.maxPerUser !== undefined ? { maxPerUser: options.maxPerUser } : {}),
+    },
+  });
+  const tierId: string = tier.json().id;
+
+  return { org, eventId, tierId, priceInPaise };
+}
+
+describe('POST /checkout/quote', () => {
+  it.each([0, -1, 101])('rejects invalid quantity %s at the HTTP boundary', async (quantity) => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server);
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: { eventId, lines: [{ tierId, quantity }] },
+    });
+    expect(response.statusCode).toBe(422);
+    await server.close();
+  });
+
+  it('rejects browser totals and ignores a line price in favor of the catalog', async () => {
+    const server = await buildServer();
+    const { eventId, tierId, priceInPaise } = await seed(server, { priceInPaise: 150_000 });
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: {
+        eventId,
+        lines: [{ tierId, quantity: 1, unitPricePaise: 1 }],
+        subtotalPaise: 1,
+        platformFeePaise: 0,
+        gstPaise: 0,
+        grandTotalPaise: 1,
+      },
+    });
+    expect(response.statusCode).toBe(422);
+    const priced = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: { eventId, lines: [{ tierId, quantity: 1, unitPricePaise: 1 }] },
+    });
+    expect(priced.statusCode).toBe(200);
+    const quote = checkoutQuoteResponseSchema.parse(priced.json());
+    expect(quote.lines[0]?.unitPricePaise).toBe(priceInPaise);
+    expect(quote.subtotalPaise).toBe(priceInPaise);
+    expect(quote.grandTotalPaise).toBeGreaterThan(priceInPaise);
+    expect(quote.grandTotalPaise).toBe(
+      quote.discountedSubtotalPaise +
+        quote.platformFeePaise +
+        quote.paymentFeePaise +
+        quote.gstPaise,
+    );
+    await server.close();
+  });
+
+  it('returns a reconciling pricing breakdown for the requested lines', async () => {
+    const server = await buildServer();
+    const { eventId, tierId, priceInPaise } = await seed(server, { priceInPaise: 150_000 });
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: { eventId, lines: [{ tierId, quantity: 2 }] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.subtotalPaise).toBe(priceInPaise * 2);
+    expect(body.currency).toBe('INR');
+    // Order of operations (pricing.ts): subtotal -> discount -> fees on the
+    // discounted subtotal -> GST on fees only. The breakdown must reconcile.
+    expect(Number(body.grandTotalPaise)).toBe(
+      Number(body.discountedSubtotalPaise) +
+        Number(body.platformFeePaise) +
+        Number(body.paymentFeePaise) +
+        Number(body.gstPaise),
+    );
+    expect(body.grandTotalPaise).toBeGreaterThan(body.subtotalPaise);
+    expect(body.lines).toHaveLength(1);
+    expect(body.lines[0]).toMatchObject({ tierId, quantity: 2, unitPricePaise: priceInPaise });
+    await server.close();
+  });
+
+  it('accepts the upgrade source field and fails closed when that ticket is not eligible', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: {
+        eventId,
+        lines: [{ tierId, quantity: 1 }],
+        upgradeFromEntitlementId: 'ENT-missing-upgrade-source',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ code: 'validation' });
+    expect(response.json().message).toMatch(/upgrade/);
+    await server.close();
+  });
+
+  it('does not reveal whether a submitted referral code is available', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server);
+
+    const withoutCode = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+    });
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: { eventId, lines: [{ tierId, quantity: 1 }], referralCode: 'REVOKED-CODE' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual(withoutCode.json());
+    await server.close();
+  });
+
+  it('unknown or restricted tier id -> indistinguishable 404', async () => {
+    const server = await buildServer();
+    const { eventId } = await seed(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: { eventId, lines: [{ tierId: 'tier_does_not_exist', quantity: 1 }] },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'not_found' });
+    await server.close();
+  });
+
+  it('unknown event id -> 404, never a 500', async () => {
+    // `quote()` first checks the event exists and is on sale, so an unknown event
+    // is a plain 404 (as it is for `createHold`, below).
+    const server = await buildServer();
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/quote',
+      payload: { eventId: 'event_does_not_exist', lines: [{ tierId: 'tier_1', quantity: 1 }] },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'not_found' });
+    await server.close();
+  });
+
+  it('createHold on an unknown event id -> 404 not_found', async () => {
+    const server = await buildServer();
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-unknown-event' },
+      payload: { eventId: 'event_does_not_exist', lines: [{ tierId: 'tier_1', quantity: 1 }] },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ code: 'not_found' });
+    await server.close();
+  });
+});
+
+describe('POST /checkout/holds', () => {
+  it('requires Idempotency-Key -> 422 validation', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+    });
+
+    expect(response.statusCode).toBe(422);
+    expect(response.json().fieldErrors).toHaveProperty('idempotency-key');
+    await server.close();
+  });
+
+  it('reserves inventory and returns an active hold with its pricing', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-1' },
+      payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+    });
+
+    expect(response.statusCode).toBe(201);
+    const body = response.json();
+    expect(body).toMatchObject({ status: 'active', convertedOrderId: null });
+    expect(body.holdId).toBeTruthy();
+    expect(body.expiresAt).toBeTruthy();
+    expect(body.pricing.lines).toHaveLength(1);
+    expect(body).not.toHaveProperty('referralAttributionStatus');
+    await server.close();
+  });
+
+  it('does not reveal whether a submitted referral code is available on the hold', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server);
+
+    const response = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-revoked-referral' },
+      payload: {
+        eventId,
+        lines: [{ tierId, quantity: 1 }],
+        referralCode: 'REVOKED-CODE',
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toMatchObject({
+      status: 'active',
+    });
+    expect(response.json()).not.toHaveProperty('referralAttributionStatus');
+    await server.close();
+  });
+
+  it('replays the same hold for a repeated Idempotency-Key (no double reservation)', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server);
+    const payload = { eventId, lines: [{ tierId, quantity: 1 }] };
+
+    const first = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-replay' },
+      payload,
+    });
+    const second = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-replay' },
+      payload,
+    });
+
+    expect(first.statusCode).toBe(201);
+    expect(second.statusCode).toBe(201);
+    expect(second.json().holdId).toBe(first.json().holdId);
+    await server.close();
+  });
+
+  it('binds tier.maxPerUser across holds and paid orders for the same user', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server, { maxPerUser: 2 });
+
+    // The cap counts live holds too, not just settled orders.
+    const first = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-cap-1' },
+      payload: { eventId, lines: [{ tierId, quantity: 2 }] },
+    });
+    expect(first.statusCode).toBe(201);
+
+    // A second basket pushed by the same user (memory driver: any request
+    // without an explicit user resolves to `user_1`) exceeds the cap.
+    const second = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-cap-2' },
+      payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+    });
+    expect(second.statusCode).toBe(400);
+    expect(second.json()).toMatchObject({
+      code: 'validation',
+      message: 'General has a maximum of 2 per user',
+    });
+
+    // A different user (distinct x-user-id) is unaffected by the cap.
+    const otherUser = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-cap-3', 'x-user-id': 'user_other' },
+      payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+    });
+    expect(otherUser.statusCode).toBe(201);
+    await server.close();
+  });
+
+  it('cannot both hold the last ticket — second guest is turned away', async () => {
+    const server = await buildServer();
+    const { eventId, tierId } = await seed(server, { quantity: 1 });
+
+    const first = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-race-1' },
+      payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+    });
+    expect(first.statusCode).toBe(201);
+
+    const second = await server.inject({
+      method: 'POST',
+      url: '/checkout/holds',
+      headers: { 'idempotency-key': 'hold-key-race-2' },
+      payload: { eventId, lines: [{ tierId, quantity: 1 }] },
+    });
+
+    expect(second.statusCode).toBe(400);
+    expect(second.json()).toMatchObject({ code: 'validation' });
+    await server.close();
+  });
+});

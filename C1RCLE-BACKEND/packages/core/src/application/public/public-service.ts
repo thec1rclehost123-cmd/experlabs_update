@@ -1,0 +1,507 @@
+import {
+  InvalidOperationError,
+  EventNotFoundError,
+  VenueNotFoundError,
+  OrganizationNotFoundError,
+  EventNotOnSaleError,
+} from '../../domain/errors.js';
+import {
+  activeTicketPricingPhase,
+  effectiveTierPricePaise,
+} from '../../domain/models/event-catalog.js';
+import { eventSalesUnavailableReason } from '../../domain/models/event-policy.js';
+import { isPublicStatus } from '../../domain/models/event.js';
+import { TicketAccessService } from '../tickets/ticket-access-service.js';
+
+import type { EntityId } from '../../domain/identity.js';
+import type { TicketTier } from '../../domain/models/event-catalog.js';
+import type { Event } from '../../domain/models/event.js';
+import type { Organization } from '../../domain/models/organization.js';
+import type { TicketAddon } from '../../domain/models/ticket-addon.js';
+import type { Venue } from '../../domain/models/venue.js';
+import type {
+  EventRepository,
+  OrganizationRepository,
+  Page,
+  PaginationQuery,
+  VenueRepository,
+} from '../../domain/ports/repositories.js';
+import type { ServiceDeps } from '../context.js';
+
+export interface PublicEventDetail {
+  event: Event;
+  venue: Venue | null;
+  organizer: Organization | null;
+}
+
+export type PublicTierAvailabilityStatus =
+  | 'available'
+  | 'sold_out'
+  | 'temporarily_held'
+  | 'not_yet_available'
+  | 'sales_ended'
+  | 'sales_paused'
+  | 'pricing_unavailable';
+
+export interface PublicPricingPhaseSummary {
+  name: string;
+  startsAt: string;
+  endsAt: string;
+  /** Number of ticket units still eligible for this phase; null means unlimited. */
+  availableQuantity: number | null;
+}
+
+export interface PublicTicketTierRow {
+  tier: TicketTier;
+  availableQuantity: number;
+  basePriceInPaise: number;
+  priceInPaise: number;
+  availabilityStatus: PublicTierAvailabilityStatus;
+  pricingPhase: PublicPricingPhaseSummary | null;
+}
+
+export interface PublicPricingSummary {
+  salesStatus:
+    | 'on_sale'
+    | 'sold_out'
+    | 'sales_paused'
+    | 'ended'
+    | 'cancelled'
+    | 'postponed'
+    | 'not_yet_available'
+    | 'temporarily_held';
+  activeStartingPricePaise: number | null;
+}
+
+function isManagedPosterKeyForOrganization(key: string, organizationId: EntityId): boolean {
+  const [root, owner, filename, ...extra] = key.split('/');
+  return (
+    root === 'posters' &&
+    owner === organizationId &&
+    extra.length === 0 &&
+    /^[A-Za-z0-9_-]+\.(?:jpg|png|webp)$/.test(filename ?? '')
+  );
+}
+
+/**
+ * ─── Public / discovery reads (Phase 4 §6) ───────────────────────────────────
+ * Unauthenticated guest-facing reads: no `ActorContext`, no writes, no
+ * business decisions — just the "only what's public" filter that every
+ * method here enforces before returning anything. Thin orchestration over
+ * repositories, same shape as every other application service (T08).
+ */
+
+/** Upper bound for the curated feed — no distinct "featured" concept exists
+ * yet (see `discovery()`), so this is also the aggregate's page size. */
+const DISCOVERY_LIMIT = 20;
+
+/** Upper bound for the naive search scan (see `search()`). */
+const SEARCH_SCAN_LIMIT = 100;
+
+export class PublicService {
+  constructor(private deps: ServiceDeps) {}
+
+  private get events(): EventRepository {
+    return this.deps.repositories.events;
+  }
+
+  private get venues(): VenueRepository {
+    return this.deps.repositories.venues;
+  }
+
+  private get organizations(): OrganizationRepository {
+    return this.deps.repositories.organizations;
+  }
+
+  /** Published/discoverable events only — `listPublic` is already filtered by
+   * the domain's `isPublic` flag, so a draft/cancelled event can never appear. */
+  async listEvents(query: PaginationQuery): Promise<Page<Event>> {
+    const page = await this.events.listPublic(query);
+    const now = this.deps.config.clock.now();
+    return {
+      ...page,
+      items: page.items.filter(
+        (event) =>
+          isPublicStatus(event.status) &&
+          event.isPublic &&
+          eventSalesUnavailableReason(event, now) !== 'Online sales have ended.',
+      ),
+    };
+  }
+
+  async getPublicPricingSummary(event: Event): Promise<PublicPricingSummary> {
+    const now = this.deps.config.clock.now();
+    if (event.status === 'cancelled')
+      return { salesStatus: 'cancelled', activeStartingPricePaise: null };
+    if (event.status === 'postponed')
+      return { salesStatus: 'postponed', activeStartingPricePaise: null };
+    if (event.status === 'sales_paused')
+      return { salesStatus: 'sales_paused', activeStartingPricePaise: null };
+    if (eventSalesUnavailableReason(event, now))
+      return { salesStatus: 'ended', activeStartingPricePaise: null };
+
+    const rows = await this.listPublicTierRows(event, now);
+    const available = rows.filter((row) => row.availabilityStatus === 'available');
+    if (available.length > 0) {
+      return {
+        salesStatus: 'on_sale',
+        activeStartingPricePaise: Math.min(...available.map((row) => row.priceInPaise)),
+      };
+    }
+    if (rows.length > 0 && rows.every((row) => row.availabilityStatus === 'sales_paused')) {
+      return { salesStatus: 'sales_paused', activeStartingPricePaise: null };
+    }
+    if (rows.length > 0 && rows.every((row) => row.availabilityStatus === 'not_yet_available')) {
+      return { salesStatus: 'not_yet_available', activeStartingPricePaise: null };
+    }
+    if (rows.length > 0 && rows.every((row) => row.availabilityStatus === 'temporarily_held')) {
+      return { salesStatus: 'temporarily_held', activeStartingPricePaise: null };
+    }
+    return { salesStatus: 'sold_out', activeStartingPricePaise: null };
+  }
+
+  async getSalesStatus(event: Event): Promise<PublicPricingSummary['salesStatus']> {
+    return (await this.getPublicPricingSummary(event)).salesStatus;
+  }
+
+  private async projectTier(
+    event: Event,
+    tier: TicketTier,
+    now: Date,
+  ): Promise<PublicTicketTierRow> {
+    const inventory = await this.deps.inventory.getTierInventory(event.id, tier.id, now);
+    const basePriceInPaise = effectiveTierPricePaise(tier);
+    let availabilityStatus: PublicTierAvailabilityStatus = 'available';
+    const tierStart = tier.salesStartAt ? Date.parse(tier.salesStartAt) : null;
+    const tierEnd = tier.salesEndAt ? Date.parse(tier.salesEndAt) : null;
+    if (
+      (tierStart !== null && !Number.isFinite(tierStart)) ||
+      (tierEnd !== null && !Number.isFinite(tierEnd)) ||
+      (tierStart !== null && tierEnd !== null && tierEnd <= tierStart)
+    ) {
+      availabilityStatus = 'pricing_unavailable';
+    } else if (tierStart !== null && tierStart > now.getTime()) {
+      availabilityStatus = 'not_yet_available';
+    } else if (tierEnd !== null && tierEnd <= now.getTime()) {
+      availabilityStatus = 'sales_ended';
+    } else if (tier.status === 'paused') {
+      availabilityStatus = 'sales_paused';
+    } else if (tier.status === 'sold_out') {
+      availabilityStatus = 'sold_out';
+    }
+
+    let phase: ReturnType<typeof activeTicketPricingPhase> = null;
+    let phaseAvailableQuantity: number | null = null;
+    try {
+      phase = activeTicketPricingPhase(tier.pricingPhases, now);
+      if (phase?.quantity !== undefined && phase?.quantity !== null) {
+        const phaseAdmissions = await this.deps.inventory.getAvailablePricingPhaseQuantity(
+          event.id,
+          tier.id,
+          phase.id,
+          now,
+        );
+        phaseAvailableQuantity = availableTicketQuantity(tier, phaseAdmissions);
+      }
+    } catch (error) {
+      if (!(error instanceof InvalidOperationError)) throw error;
+      availabilityStatus = 'pricing_unavailable';
+      phase = null;
+      phaseAvailableQuantity = 0;
+    }
+
+    const availableAdmissions = Math.max(0, inventory.availableQuantity);
+    const availableQuantity = availableTicketQuantity(tier, availableAdmissions);
+    if (availabilityStatus === 'available' && availableQuantity === 0) {
+      availabilityStatus =
+        inventory.heldQuantity > 0 && inventory.soldQuantity < (tier.quantity ?? 0)
+          ? 'temporarily_held'
+          : 'sold_out';
+    }
+    const priceInPaise =
+      phase && (phaseAvailableQuantity === null || phaseAvailableQuantity > 0)
+        ? phase.priceInPaise
+        : basePriceInPaise;
+    return {
+      tier,
+      basePriceInPaise,
+      priceInPaise,
+      availableQuantity: availabilityStatus === 'available' ? availableQuantity : 0,
+      availabilityStatus,
+      pricingPhase: phase
+        ? {
+            name: phase.name,
+            startsAt: phase.startsAt,
+            endsAt: phase.endsAt,
+            availableQuantity: phaseAvailableQuantity,
+          }
+        : null,
+    };
+  }
+
+  private async listPublicTierRows(event: Event, now: Date): Promise<PublicTicketTierRow[]> {
+    const tiers = await this.deps.repositories.catalog.listTiers(event.id);
+    const rows: PublicTicketTierRow[] = [];
+    for (const tier of tiers) {
+      if (
+        tier.audienceType === 'STUDENT' ||
+        tier.audienceType === 'MEMBER' ||
+        (tier.accessMode ?? 'public') !== 'public'
+      )
+        continue;
+      rows.push(await this.projectTier(event, tier, now));
+    }
+    return rows;
+  }
+
+  async getCurrentStartingPricePaise(
+    idOrSlug: EntityId,
+    userId?: EntityId,
+    accessGrantId?: EntityId,
+  ): Promise<number | null> {
+    try {
+      const tiers = await this.listEventTiers(idOrSlug, userId, accessGrantId);
+      const prices = tiers
+        .filter((tier) => tier.availableQuantity > 0)
+        .map((tier) => tier.priceInPaise);
+      return prices.length ? Math.min(...prices) : null;
+    } catch (cause) {
+      if (cause instanceof EventNotOnSaleError) return null;
+      throw cause;
+    }
+  }
+
+  /**
+   * Active sellable tiers for a public event, each with live availability
+   * (`quantity - sold - activeHolds`). Non-public events 404 via `getEvent`
+   * (same no-oracle rule); paused/sold_out tiers stay hidden from guests.
+   */
+  async listEventTiers(
+    idOrSlug: EntityId,
+    userId?: EntityId,
+    accessGrantId?: EntityId,
+  ): Promise<PublicTicketTierRow[]> {
+    const { event } = await this.getEvent(idOrSlug, userId, accessGrantId);
+    const now = this.deps.config.clock.now();
+    const unavailable = eventSalesUnavailableReason(event, now);
+    if (unavailable) throw new EventNotOnSaleError(unavailable);
+    const eventGrant = Boolean(
+      userId &&
+      accessGrantId &&
+      (await new TicketAccessService(this.deps).hasGrantForEvent(
+        accessGrantId,
+        userId,
+        event.id,
+        event.visibilityMode === 'invited' ? 'invitation' : 'code',
+      )),
+    );
+    const tiers = await this.deps.repositories.catalog.listTiers(event.id);
+    const rows: PublicTicketTierRow[] = [];
+    for (const tier of tiers) {
+      if (
+        tier.status === 'paused' ||
+        tier.audienceType === 'STUDENT' ||
+        tier.audienceType === 'MEMBER'
+      )
+        continue;
+      const accessMode = tier.accessMode ?? 'public';
+      if (accessGrantId && !eventGrant && accessMode === 'public') continue;
+      if (accessMode !== 'public') {
+        if (
+          !userId ||
+          !accessGrantId ||
+          !(await new TicketAccessService(this.deps).hasGrantForTier(
+            accessGrantId,
+            userId,
+            event.id,
+            tier.id,
+          ))
+        )
+          continue;
+      }
+      rows.push(await this.projectTier(event, tier, now));
+    }
+    return rows;
+  }
+
+  async listEventTicketAddons(
+    idOrSlug: EntityId,
+    userId?: EntityId,
+    accessGrantId?: EntityId,
+  ): Promise<{ addon: TicketAddon; availableQuantity: number }[]> {
+    const { event } = await this.getEvent(idOrSlug, userId, accessGrantId);
+    if (this.deps.config.features.m5TicketAddonsEnabled !== true) return [];
+    const addons = await this.deps.repositories.catalog.listTicketAddons(event.id);
+    const rows: { addon: TicketAddon; availableQuantity: number }[] = [];
+    for (const addon of addons) {
+      if (addon.status !== 'active') continue;
+      const availableQuantity = await this.deps.inventory.getAvailableTicketAddonQuantity(addon.id);
+      rows.push({ addon, availableQuantity });
+    }
+    return rows;
+  }
+
+  /**
+   * `idOrSlug`: tries the id first (cheap point read), falls back to a slug
+   * lookup. Public events and explicitly unlisted direct links are returned;
+   * other unpublished/private-status events report the same `event_not_found`
+   * as a truly missing id, so this is never an existence oracle for drafts.
+   */
+  async getEvent(
+    idOrSlug: EntityId,
+    userId?: EntityId,
+    accessGrantId?: EntityId,
+  ): Promise<PublicEventDetail> {
+    const byId = await this.events.getById(idOrSlug);
+    const event = byId ?? (await this.events.getBySlug(idOrSlug));
+    const unlistedDirectLink = event?.visibilityMode === 'unlisted';
+    const privateVisibility =
+      event?.visibilityMode === 'code' || event?.visibilityMode === 'invited';
+    const authorizedPrivate = Boolean(
+      event &&
+      privateVisibility &&
+      userId &&
+      accessGrantId &&
+      (await new TicketAccessService(this.deps).hasGrantForEvent(
+        accessGrantId,
+        userId,
+        event.id,
+        event.visibilityMode === 'invited' ? 'invitation' : 'code',
+      )),
+    );
+    if (
+      !event ||
+      !isPublicStatus(event.status) ||
+      (!event.isPublic && !unlistedDirectLink && !authorizedPrivate)
+    ) {
+      throw new EventNotFoundError(idOrSlug);
+    }
+
+    const [venue, organizer] = await Promise.all([
+      event.venueId === null ? null : this.venues.getById(event.venueId),
+      this.organizations.getById(event.organizationId),
+    ]);
+
+    let publicProjectionEvent = event;
+    if (authorizedPrivate) {
+      let imageUrl: string | null = null;
+      const privatePath = event.privateImageStoragePath;
+      if (privatePath && isManagedPosterKeyForOrganization(privatePath, event.organizationId)) {
+        const grant = await this.deps.objectStorage.issueReadUrl({
+          key: privatePath,
+          expiresAt: this.deps.config.clock.now().getTime() + 5 * 60 * 1000,
+        });
+        imageUrl = grant.readUrl;
+      }
+      publicProjectionEvent = { ...event, imageUrl };
+    } else if (privateVisibility) {
+      publicProjectionEvent = { ...event, imageUrl: null };
+    }
+
+    return {
+      event: publicProjectionEvent,
+      venue: venue?.status === 'active' ? venue : null,
+      organizer: organizer?.status === 'active' ? organizer : null,
+    };
+  }
+
+  /** Venue public profile by slug. A suspended venue is not discoverable. */
+  async getVenue(slug: string): Promise<Venue> {
+    const venue = await this.venues.getBySlugGlobal(slug);
+    if (!venue || venue.status !== 'active') {
+      throw new VenueNotFoundError(slug);
+    }
+    return venue;
+  }
+
+  /**
+   * Venue public profile by id — for guests resolving an event's `venueId`
+   * (events carry the id, not the slug). Same active-only rule as `getVenue`,
+   * so a suspended venue's events show a venue-TBA fallback, never its name.
+   */
+  async getVenueById(venueId: EntityId): Promise<Venue> {
+    const venue = await this.venues.getById(venueId);
+    if (!venue || venue.status !== 'active') {
+      throw new VenueNotFoundError(venueId);
+    }
+    return venue;
+  }
+
+  /** Host/organization public profile by slug. Only an active tenant is public. */
+  async getHost(slug: string): Promise<Organization> {
+    const org = await this.organizations.getBySlug(slug);
+    if (!org || org.status !== 'active') {
+      throw new OrganizationNotFoundError(slug);
+    }
+    return org;
+  }
+
+  /**
+   * Host public profile by id — for guests resolving an event's
+   * `organizationId` (events carry the id, not the slug). Same active-only
+   * rule as `getHost`.
+   */
+  async getHostById(organizationId: EntityId): Promise<Organization> {
+    const org = await this.organizations.getById(organizationId);
+    if (!org || org.status !== 'active') {
+      throw new OrganizationNotFoundError(organizationId);
+    }
+    return org;
+  }
+
+  /**
+   * Curated/featured feed. No distinct "featured" domain concept exists yet
+   * (nothing marks an event as editorially curated), so this is a reasonable
+   * aggregate instead: the soonest-starting published events, capped at
+   * `DISCOVERY_LIMIT`. Revisit if/when curation becomes a real concept.
+   */
+  async discovery(): Promise<Event[]> {
+    return this.events.listUpcomingPublic(
+      this.deps.config.clock.now().toISOString(),
+      DISCOVERY_LIMIT,
+    );
+  }
+
+  /**
+   * Substring search over title/summary/tags. No search index exists yet, so
+   * this scans a bounded page of public events (`SEARCH_SCAN_LIMIT`) rather
+   * than the whole collection — a real index (e.g. Algolia/Typesense) is
+   * future work, tracked here as a known limitation rather than silently
+   * presented as full-text search over the entire catalogue.
+   */
+  async search(q: string, query: PaginationQuery): Promise<Page<Event>> {
+    const needle = q.trim().toLowerCase();
+    const page = await this.events.listPublic({ limit: SEARCH_SCAN_LIMIT });
+    const now = this.deps.config.clock.now();
+    const matches = page.items.filter(
+      (event) =>
+        isPublicStatus(event.status) &&
+        eventSalesUnavailableReason(event, now) !== 'Online sales have ended.' &&
+        matchesQuery(event, needle),
+    );
+    const start = query.cursor ? matches.findIndex((event) => event.id === query.cursor) + 1 : 0;
+    const end = Math.min(start + query.limit, matches.length);
+    const items = matches.slice(start, end);
+    const last = items[items.length - 1];
+    return {
+      items,
+      total: matches.length,
+      nextCursor: end < matches.length && last ? last.id : null,
+    };
+  }
+}
+
+export function availableTicketQuantity(tier: TicketTier, availableAdmissions: number): number {
+  if (tier.admissionMode !== 'per_person') return availableAdmissions;
+  const guestCount = tier.guestCount ?? 1;
+  return guestCount > 0 ? Math.floor(availableAdmissions / guestCount) : 0;
+}
+
+function matchesQuery(event: Event, needle: string): boolean {
+  if (needle.length === 0) return true;
+  return (
+    event.title.toLowerCase().includes(needle) ||
+    event.summary.toLowerCase().includes(needle) ||
+    event.tags.some((tag) => tag.toLowerCase().includes(needle))
+  );
+}

@@ -1,0 +1,273 @@
+import { InvalidOperationError, VersionConflictError } from '../../domain/errors.js';
+import { committedTierQuantity } from '../../domain/models/tier-inventory.js';
+
+import { compareAndSet } from './compare-and-set.js';
+import { paginateQuery } from './pagination.js';
+
+import type { EntityId } from '../../domain/identity.js';
+import type {
+  TicketTier,
+  PromoCode,
+  TablePackage,
+  PromoterAssignment,
+} from '../../domain/models/event-catalog.js';
+import type { TicketAddon } from '../../domain/models/ticket-addon.js';
+import type {
+  EventCatalogRepository,
+  Page,
+  PaginationQuery,
+  TxContext,
+} from '../../domain/ports/repositories.js';
+import type { DocumentData, Firestore, Query } from 'firebase-admin/firestore';
+
+const TIERS = 'v2_event_catalog_tiers';
+const TICKET_ADDONS = 'v2_event_ticket_addons';
+const PROMOS = 'v2_event_catalog_promos';
+const TABLES = 'v2_event_catalog_tables';
+const ASSIGNMENTS = 'v2_event_catalog_promoter_assignments';
+
+/**
+ * An active (never-suspended) assignment has no `suspendedAt` field in
+ * Firestore at all — it's only written by `suspendPromoterAssignment`. The
+ * domain type is `string | null`, never `undefined`, so a raw cast straight
+ * through fails the response schema (which requires the real type, not
+ * `undefined`) for every currently-active promoter.
+ */
+function toAssignment(data: DocumentData): PromoterAssignment {
+  return {
+    ...(data as unknown as PromoterAssignment),
+    endedAt: (data.endedAt ?? null) as string | null,
+    suspendedAt: (data.suspendedAt ?? null) as string | null,
+    suspendedFromStatus:
+      (data.suspendedFromStatus as PromoterAssignment['suspendedFromStatus'] | undefined) ?? null,
+    invitedAt: (data.invitedAt as string | null | undefined) ?? null,
+    invitedBy: (data.invitedBy as string | null | undefined) ?? null,
+    respondedAt: (data.respondedAt as string | null | undefined) ?? null,
+    respondedBy: (data.respondedBy as string | null | undefined) ?? null,
+    acceptedAt: (data.acceptedAt as string | null | undefined) ?? null,
+    rejectedAt: (data.rejectedAt as string | null | undefined) ?? null,
+    revokedAt: (data.revokedAt as string | null | undefined) ?? null,
+    revokedBy: (data.revokedBy as string | null | undefined) ?? null,
+    revocationReason: (data.revocationReason as string | null | undefined) ?? null,
+    startsAt: (data.startsAt as string | null | undefined) ?? null,
+    expiresAt: (data.expiresAt as string | null | undefined) ?? null,
+    eligibleTierIds: (data.eligibleTierIds as string[] | null | undefined) ?? null,
+  };
+}
+
+/** Firestore adapter for `EventCatalogRepository` (B12) — tiers/promos/tables/promoter-assignments. */
+export class FirestoreEventCatalogRepository implements EventCatalogRepository {
+  constructor(private readonly db: Firestore) {}
+
+  // ── Ticket add-ons ────────────────────────────────────────────────────────
+  async getTicketAddonById(addonId: EntityId): Promise<TicketAddon | null> {
+    const snap = await this.db.collection(TICKET_ADDONS).doc(addonId).get();
+    return snap.exists ? (snap.data() as unknown as TicketAddon) : null;
+  }
+  async listTicketAddons(eventId: EntityId): Promise<TicketAddon[]> {
+    const snap = await this.db.collection(TICKET_ADDONS).where('eventId', '==', eventId).get();
+    return snap.docs.map((doc) => doc.data() as unknown as TicketAddon);
+  }
+  async saveTicketAddon(addon: TicketAddon, _tx?: TxContext | null): Promise<void> {
+    await this.db
+      .collection(TICKET_ADDONS)
+      .doc(addon.id)
+      .set({ ...addon });
+  }
+
+  // ── Ticket tiers ──────────────────────────────────────────────────────────
+  async getTierById(tierId: EntityId): Promise<TicketTier | null> {
+    const snap = await this.db.collection(TIERS).doc(tierId).get();
+    const data = snap.data();
+    return snap.exists && data ? fromTierDoc(data) : null;
+  }
+  async listTiers(eventId: EntityId): Promise<TicketTier[]> {
+    const snap = await this.db.collection(TIERS).where('eventId', '==', eventId).get();
+    return snap.docs.map((doc) => fromTierDoc(doc.data()));
+  }
+  async findWalkInTier(eventId: EntityId): Promise<TicketTier | null> {
+    const snap = await this.db
+      .collection(TIERS)
+      .where('eventId', '==', eventId)
+      .where('entryType', '==', 'walkin')
+      .limit(1)
+      .get();
+    if (snap.empty) return null;
+    const doc = snap.docs[0];
+    if (!doc) return null;
+    return doc.exists ? fromTierDoc(doc.data()) : null;
+  }
+  async findDineInTier(eventId: EntityId): Promise<TicketTier | null> {
+    const snap = await this.db
+      .collection(TIERS)
+      .where('eventId', '==', eventId)
+      .where('entryType', '==', 'dinein')
+      .limit(1)
+      .get();
+    if (snap.empty) return null;
+    const doc = snap.docs[0];
+    if (!doc) return null;
+    return doc.exists ? fromTierDoc(doc.data()) : null;
+  }
+  async saveTier(tier: TicketTier, _tx?: TxContext | null): Promise<void> {
+    const data = { ...tier } as Record<string, unknown>;
+    if (tier.accessType === 'RSVP') {
+      delete data.priceInPaise;
+      delete data.pricingPhases;
+      delete data.doorPriceInPaise;
+      delete data.commissionEligible;
+    }
+    await this.db.collection(TIERS).doc(tier.id).set(data);
+  }
+  async updateTier(tier: TicketTier, options?: { now: Date }): Promise<void> {
+    const data = { ...tier } as Record<string, unknown>;
+    if (tier.accessType === 'RSVP') {
+      delete data.priceInPaise;
+      delete data.pricingPhases;
+      delete data.doorPriceInPaise;
+      delete data.commissionEligible;
+    }
+    const ref = this.db.collection(TIERS).doc(tier.id);
+    const sequenceRef = this.db.collection('v2_hold_sequences').doc(tier.eventId);
+    await this.db.runTransaction(async (tx) => {
+      const [currentSnap, sequenceSnap, orders, holds] = await Promise.all([
+        tx.get(ref),
+        tx.get(sequenceRef),
+        tx.get(this.db.collection('v2_orders').where('eventId', '==', tier.eventId)),
+        tx.get(this.db.collection('v2_cart_reservations').where('eventId', '==', tier.eventId)),
+      ]);
+      const current = currentSnap.data();
+      if (!current || Number(current.version ?? 0) !== tier.version - 1) {
+        throw new VersionConflictError(tier.version - 1, Number(current?.version ?? 0));
+      }
+      if (tier.quantity !== current.quantity) {
+        const committed = committedTierQuantity(
+          tier.id,
+          orders.docs.map(
+            (doc) =>
+              doc.data() as { status: string; lines: { tierId: string; quantity: number }[] },
+          ),
+          holds.docs.map(
+            (doc) =>
+              doc.data() as {
+                status: string;
+                expiresAt: string;
+                lines: { tierId: string; quantity: number }[];
+              },
+          ),
+          options?.now ?? new Date(),
+        );
+        if (tier.quantity < committed)
+          throw new InvalidOperationError(
+            'Inventory cannot be reduced below sold and actively held tickets',
+          );
+      }
+      // Hold creation, RSVP acquisition and configuration edits share this
+      // serialization point; a concurrent commitment forces a fresh read.
+      tx.set(sequenceRef, {
+        ...sequenceSnap.data(),
+        eventId: tier.eventId,
+        last: Number(sequenceSnap.data()?.last ?? 0),
+      });
+      tx.set(ref, data);
+    });
+  }
+
+  // ── Promo codes ───────────────────────────────────────────────────────────
+  async getPromoById(promoId: EntityId): Promise<PromoCode | null> {
+    const snap = await this.db.collection(PROMOS).doc(promoId).get();
+    return snap.exists ? (snap.data() as unknown as PromoCode) : null;
+  }
+  async getPromoByCode(code: string, eventId: EntityId | null): Promise<PromoCode | null> {
+    const normalized = code.toUpperCase().trim();
+    let ref: Query = this.db.collection(PROMOS).where('code', '==', normalized);
+    if (eventId !== null) ref = ref.where('eventId', '==', eventId);
+    const snap = await ref.limit(1).get();
+    const doc = snap.docs[0];
+    return doc ? (doc.data() as unknown as PromoCode) : null;
+  }
+  async listPromos(eventId: EntityId, query: PaginationQuery): Promise<Page<PromoCode>> {
+    const base = this.db.collection(PROMOS).where('eventId', '==', eventId);
+    return paginateQuery(base, query, (data: DocumentData) => data as unknown as PromoCode);
+  }
+  async listAllPromos(query: PaginationQuery): Promise<Page<PromoCode>> {
+    const base = this.db.collection(PROMOS);
+    return paginateQuery(base, query, (data: DocumentData) => data as unknown as PromoCode);
+  }
+  async savePromo(promo: PromoCode, _tx?: TxContext | null): Promise<void> {
+    await this.db
+      .collection(PROMOS)
+      .doc(promo.id)
+      .set({ ...promo });
+  }
+
+  // ── Table packages ────────────────────────────────────────────────────────
+  async getTableById(tableId: EntityId): Promise<TablePackage | null> {
+    const snap = await this.db.collection(TABLES).doc(tableId).get();
+    return snap.exists ? (snap.data() as unknown as TablePackage) : null;
+  }
+  async listTables(eventId: EntityId): Promise<TablePackage[]> {
+    const snap = await this.db.collection(TABLES).where('eventId', '==', eventId).get();
+    return snap.docs.map((doc) => doc.data() as unknown as TablePackage);
+  }
+  async saveTable(table: TablePackage, _tx?: TxContext | null): Promise<void> {
+    await this.db
+      .collection(TABLES)
+      .doc(table.id)
+      .set({ ...table });
+  }
+
+  // ── Promoter assignments ──────────────────────────────────────────────────
+  async getAssignmentById(assignmentId: EntityId): Promise<PromoterAssignment | null> {
+    const snap = await this.db.collection(ASSIGNMENTS).doc(assignmentId).get();
+    // Narrow on the data rather than on `snap.exists`: the assertion form
+    // (`as DocumentData` or `!`) is rejected by the lint pair
+    // `non-nullable-type-assertion-style` / `no-non-null-assertion`.
+    const data = snap.data();
+    return data ? toAssignment(data) : null;
+  }
+  async listAssignments(eventId: EntityId): Promise<PromoterAssignment[]> {
+    const snap = await this.db.collection(ASSIGNMENTS).where('eventId', '==', eventId).get();
+    return snap.docs.map((doc) => toAssignment(doc.data()));
+  }
+  async listAssignmentsByPromoter(promoterId: EntityId): Promise<PromoterAssignment[]> {
+    const snap = await this.db.collection(ASSIGNMENTS).where('promoterId', '==', promoterId).get();
+    return snap.docs.map((doc) => toAssignment(doc.data()));
+  }
+  async listExpiredAssignments(now: Date, limit: number): Promise<PromoterAssignment[]> {
+    const snap = await this.db
+      .collection(ASSIGNMENTS)
+      .where('status', 'in', ['invited', 'accepted', 'active'])
+      .where('expiresAt', '<=', now.toISOString())
+      .orderBy('expiresAt', 'asc')
+      .limit(Math.max(1, Math.min(limit, 100)))
+      .get();
+    return snap.docs
+      .map((doc) => toAssignment(doc.data()))
+      .filter(
+        (assignment) =>
+          assignment.expiresAt !== null && Number.isFinite(Date.parse(assignment.expiresAt)),
+      );
+  }
+  async listAllAssignments(query: PaginationQuery): Promise<Page<PromoterAssignment>> {
+    const base = this.db.collection(ASSIGNMENTS);
+    return paginateQuery(base, query, toAssignment);
+  }
+  async saveAssignment(assignment: PromoterAssignment, _tx?: TxContext | null): Promise<void> {
+    await compareAndSet(this.db, this.db.collection(ASSIGNMENTS), assignment, (value) => ({
+      ...value,
+    }));
+  }
+}
+
+function fromTierDoc(data: DocumentData): TicketTier {
+  // RSVP's non-applicable fields are intentionally absent in Firestore. Keep
+  // the internal pricing projection numeric for existing checkout consumers.
+  return {
+    ...(data as unknown as TicketTier),
+    priceInPaise: (data.priceInPaise as number | undefined) ?? 0,
+    pricingPhases: (data.pricingPhases as TicketTier['pricingPhases'] | undefined) ?? [],
+    commissionEligible: (data.commissionEligible as boolean | undefined) ?? false,
+    doorPriceInPaise: (data.doorPriceInPaise as number | null | undefined) ?? null,
+  };
+}

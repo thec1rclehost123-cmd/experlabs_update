@@ -1,0 +1,93 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+allowBuilds:
+  '@firebase/util': true
+  esbuild: true
+  protobufjs: true
+  unrs-resolver: true
+
+onlyBuiltDependencies:
+  - '@firebase/util'
+  - esbuild
+  - protobufjs
+  - unrs-resolver
+
+# Dependency overrides MUST live here (pnpm-workspace.yaml), not in a
+# package.json "pnpm" field — pnpm >= 10 no longer reads the latter and emits a
+# warning instead of applying it.
+overrides:
+  # tar: remediate CVE-2026-73566 (tar < 7.5.21). Primary fix is the pnpm
+  # version bump + Dockerfile apt/sed patch; this is the npm-layer backstop.
+  tar: '>=7.5.21'
+  # fast-uri ^3 (ajv) and ^4 (fast-json-stringify/@fastify/ajv-compiler) — keep
+  # each compatible major at or above its latest advisory fix.
+  #   nanoid   -> 3.3.18          fixes CVE-2026-67213 (DoS via infinite loop)
+  'fast-uri@^3.0.0': '3.1.9'
+  'fast-uri@^4.0.0': '4.2.3'
+  fastify: '>=5.12.6'
+  '@vitest/mocker': '>=4.1.12'
+  'nanoid@^3.0.0': '3.3.18'
+  # brace-expansion: THIRD advisory family GHSA-q2hr-2g5m-vwhr (quadratic-time
+  # CPU DoS on `{a},b}` rewrites) on top of GHSA-qhr7-859c-m2p7 +
+  # GHSA-6j4f-fj2g-mc7p (uncontrolled recursion). minimatch@3.x pulls the 1.x
+  # line, minimatch@10.x the 5.x line — 1.1.18 / 5.0.9 are all flagged (HIGH by
+  # pnpm audit AND Trivy CVE-2026-102276 / CVE-2026-102278). 1.1.21 / 5.0.12 are
+  # the newest patched releases covering every advisory above.
+  'brace-expansion@<2': '1.1.21'
+  'brace-expansion@>=2 <6': '5.0.12'
+  # uuid < 11.1.1 (GHSA-w5hq-g745-h8pq — missing buffer bounds check in v3/v5/v6
+  # when a caller-provided buffer is used). Tree resolves 9.0.1 via firebase-admin
+  # -> google-gax -> google-auth-library -> gaxios, all of which are CommonJS;
+  # per the pnpm deprecation note, CommonJS codebases must stay on uuid@11
+  # (uuid >= 12 dropped the CJS build). Pin 11.1.1 exactly — do NOT use
+  # '>=11.1.1', it resolves to an ESM-only major that breaks require().
+  uuid: '11.1.1'
+  # js-yaml >= 4.3.2 fixes GHSA-2883-xcg3-v3hh (CPU exhaustion via empty merge
+  # sources in YAML). Affects @commitlint, eslint, and 29 other transitive paths.
+  js-yaml: '>=4.3.2'
+  # @grpc/grpc-js 1.14.0-1.14.4 (GHSA-m9gg-hp2v-232j): getAuthContext can
+  # return unauthorized certificates as though they were authorized. Pulled in
+  # via firebase-admin -> @google-cloud/firestore -> google-gax. 1.14.5 is the
+  # patched release.
+  '@grpc/grpc-js': '>=1.14.5'
+  # @fastify/busboy 3.2.0 and earlier: Denial of Service (GHSA-xjh9-v7x6-24jw,
+  # GHSA-x8mw-p69m-v3mx; Trivy CVE-2026-19481 / CVE-2026-19484). 3.2.1 is the
+  # patched release. Floor, not an exact pin, so a newer patched release needs
+  # no manifest edit.
+  '@fastify/busboy': '>=3.2.1'
+  # source-map-js < 1.2.2 (CVE-2026-93749): Denial of Service via malformed
+  # indexed source maps. Pulled in transitively by magicast and postcss. 1.2.2 is
+  # the patched release.
+  source-map-js: '>=1.2.2'
+  # vite 8.2.0 - 8.2.3 (CVE-2026-112942, GHSA-587h-7wmj-h5pm): command injection
+  # via improper file path validation in launch-editor, bundled in the dev server.
+  # Reached only through vitest (devDependency), but pnpm audit and the Docker
+  # Trivy scan both fail HIGH on it. 8.2.4 is the patched release on the 8.2 line
+  # vitest already resolves; pinned EXACTLY and scoped to that line so a newer
+  # major is not pulled in by accident.
+  'vite@>=8.2.0 <8.3.0': '8.2.4'
+  # zod < 4.6.6: memory exhaustion while validating oversized constrained
+  # collections (high; pnpm audit and the Docker Trivy scan both fail on it).
+  # zod is the wire-contract validator for the gateway and for better-auth, so it
+  # reaches every request path. 4.6.6 is the first patched release. Floor, not an
+  # exact pin, so a newer patched release needs no manifest edit. The frontend
+  # repo pins zod too and must stay on the same minor: the contract parity check
+  # builds both sides with one zod.
+  zod: '>=4.6.6'
+  # Better Auth before 1.7.7 has critical and high-severity authentication
+  # advisories. Keep all transitive consumers on the patched release line.
+  better-auth: '>=1.7.7'
+
+# Audit exceptions. Each entry MUST name one advisory, say why it is safe, and say
+# when to remove it. Do not add blanket or severity-level ignores.
+auditConfig:
+  ignoreGhsas:
+    # picomatch <= 4.0.7 — ReDoS through single-branch repeated extglobs
+    # (GHSA-fc5q-39xc-vjpf, high). No patched release exists (npm latest is
+    # 4.0.7, itself affected). Reached ONLY through dev tooling (vitest/vite ->
+    # tinyglobby/fdir, eslint, etc.); `pnpm why picomatch --prod` is empty, so it
+    # is not in the runtime image. REMOVE this entry as soon as a fixed picomatch
+    # is published and the lockfile resolves it.
+    - GHSA-fc5q-39xc-vjpf
